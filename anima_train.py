@@ -250,7 +250,24 @@ def train(args):
         "cpu", args.pretrained_model_name_or_path, args.attn_mode, args.split_attn, "cpu", dit_weight_dtype=None
     )
 
-    if args.gradient_checkpointing:
+    if args.selective_checkpointing is not None or args.checkpoint_blocks is not None:
+        from library.selective_checkpointing import apply_selective_checkpointing
+
+        checkpoint_plan = apply_selective_checkpointing(
+            dit,
+            strategy=args.selective_checkpointing,
+            checkpoint_blocks=args.checkpoint_blocks,
+            cpu_offload=args.cpu_offload_checkpointing,
+            unsloth_offload=args.unsloth_offload_checkpointing,
+        )
+        logger.info(
+            "Anima selective checkpointing: strategy=%s checkpointed=%d/%d indices=%s",
+            checkpoint_plan.strategy,
+            checkpoint_plan.checkpointed_blocks,
+            checkpoint_plan.num_blocks,
+            checkpoint_plan.checkpointed_indices,
+        )
+    elif args.gradient_checkpointing:
         dit.enable_gradient_checkpointing(
             cpu_offload=args.cpu_offload_checkpointing,
             unsloth_offload=args.unsloth_offload_checkpointing,
@@ -743,6 +760,18 @@ def setup_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="offload activations to CPU RAM using async non-blocking transfers (faster than --cpu_offload_checkpointing). "
         "Cannot be used with --cpu_offload_checkpointing or --blocks_to_swap.",
+    )
+    parser.add_argument(
+        "--selective_checkpointing",
+        choices=("none", "full", "interleaved", "every4", "count"),
+        default=None,
+        help="opt-in per-block checkpoint placement for Anima; full preserves --gradient_checkpointing behavior",
+    )
+    parser.add_argument(
+        "--checkpoint_blocks",
+        type=int,
+        default=None,
+        help="exact number of evenly-spaced Anima blocks to checkpoint; implies selective count mode",
     )
     parser.add_argument(
         "--skip_latents_validity_check",
