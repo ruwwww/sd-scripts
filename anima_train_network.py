@@ -179,6 +179,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
                 getattr(args, "fused_mlp_storage", "bf16"),
                 getattr(args, "fused_mlp_rank", 64),
                 getattr(args, "fused_mlp_fp8_backend", "auto"),
+                getattr(args, "fused_mlp_fp8_input", False),
             )
             if enabled == 0:
                 raise RuntimeError("--fused_mlp found no eligible dropout-free LoRA GELU MLP modules")
@@ -536,6 +537,11 @@ def setup_parser() -> argparse.ArgumentParser:
         choices=("auto", "eager", "triton"),
         default="auto",
         help="FP8 activation cache backend; auto uses fused Triton storage kernels when available",
+    )
+    parser.add_argument(
+        "--fused_mlp_fp8_input",
+        action="store_true",
+        help="experimental: also store the MLP input X as row-wise FP8 for the LoRA backward",
     )
     return parser
 

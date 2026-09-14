@@ -114,6 +114,28 @@ gradient cosine of 0.999995 against the exact BF16 fused path, with relative
 gradient L2 error around 0.30%. Treat those numbers as a reference, not a
 guarantee for every GPU or model shape.
 
+### Optional R&D: store the MLP input `X` as FP8
+
+The custom MLP VJP also saves its input `X` for the first LoRA down-gradient.
+The following additional flag stores that private saved copy as row-wise FP8
+and dequantizes it only when computing `dLoRA_down`:
+
+```bash
+--fused_mlp_storage=fp8 \
+--fused_mlp_fp8_backend=auto \
+--fused_mlp_fp8_input
+```
+
+This does not change the forward output and does not compress the residual
+stream globally. It is an experimental memory extension. On the tested target
+with 12 checkpointed blocks it reduced peak allocation from about 11,391 MiB
+to 11,281 MiB, with step time changing from about 1,657 ms to 1,660 ms. With
+8 checkpointed blocks it reduced peak allocation by about 133 MiB and remained
+within the same timing noise. Validate LoRA gradient and image drift on the
+target dataset before enabling it for a long run; the additional quantization
+only affects the LoRA input-gradient path, but it is still a reduced-precision
+backward.
+
 ## Recipe 3: low-rank activation storage (research mode)
 
 This mode stores a randomized rank-`r` approximation of the pre-GELU state.

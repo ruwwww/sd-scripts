@@ -89,6 +89,7 @@ def test_fp8_and_lowrank_storage_keep_forward_and_gradient_direction():
 
     for operation in (
         lambda values: fused_gelu_mlp_fp8(*values, backend="eager"),
+        lambda values: fused_gelu_mlp_fp8(*values, backend="eager", store_input_fp8=True),
         lambda values: fused_gelu_mlp_lowrank(*values, rank=4),
     ):
         inputs = [value.detach().clone().requires_grad_(value.requires_grad) for value in inputs_ref]

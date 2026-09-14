@@ -628,6 +628,7 @@ class LoRANetwork(torch.nn.Module):
         activation_storage: str = "bf16",
         activation_rank: int = 64,
         fp8_backend: str = "auto",
+        fp8_input: bool = False,
     ):
         """Opt into the explicit-VJP Linear-GELU-Linear path."""
 
@@ -635,6 +636,8 @@ class LoRANetwork(torch.nn.Module):
             raise ValueError(f"unsupported fused MLP activation storage: {activation_storage}")
         if fp8_backend not in ("auto", "eager", "triton"):
             raise ValueError(f"unsupported FP8 kernel backend: {fp8_backend}")
+        if fp8_input and activation_storage != "fp8":
+            raise ValueError("fp8_input requires activation_storage='fp8'")
         if activation_storage == "bf16":
             fused_op = fused_gelu_mlp
         elif activation_storage == "fp8":
@@ -672,11 +675,12 @@ class LoRANetwork(torch.nn.Module):
                 second = lora_by_base.get(id(getattr(mlp, "layer2", None)))
                 if first is not None and second is not None:
                     eligible += 1
-            self._pending_fused_mlp = (activation_storage, int(activation_rank), fp8_backend)
+            self._pending_fused_mlp = (activation_storage, int(activation_rank), fp8_backend, bool(fp8_input))
             logger.info(
-                "deferred explicit-VJP GELU MLP path until LoRA apply_to storage=%s rank=%s eligible=%d",
+                "deferred explicit-VJP GELU MLP path until LoRA apply_to storage=%s rank=%s fp8_input=%s eligible=%d",
                 activation_storage,
                 activation_rank if activation_storage == "lowrank" else "n/a",
+                fp8_input,
                 eligible,
             )
             return eligible
@@ -727,7 +731,7 @@ class LoRANetwork(torch.nn.Module):
                 if activation_storage == "lowrank":
                     return fused_op(*arguments, int(activation_rank))
                 if activation_storage == "fp8":
-                    return fused_op(*arguments, fp8_backend)
+                    return fused_op(*arguments, fp8_backend, bool(fp8_input))
                 return fused_op(*arguments)
 
             mlp.forward = types.MethodType(_fused_forward, mlp)
@@ -735,9 +739,10 @@ class LoRANetwork(torch.nn.Module):
             enabled += 1
 
         logger.info(
-            "enabled explicit-VJP GELU MLP path storage=%s rank=%s for %d modules",
+            "enabled explicit-VJP GELU MLP path storage=%s rank=%s fp8_input=%s for %d modules",
             activation_storage,
             activation_rank if activation_storage == "lowrank" else fp8_backend if activation_storage == "fp8" else "n/a",
+            fp8_input,
             enabled,
         )
         return enabled
@@ -776,9 +781,9 @@ class LoRANetwork(torch.nn.Module):
             self.add_module(lora.lora_name, lora)
 
         if self._pending_fused_mlp is not None:
-            activation_storage, activation_rank, fp8_backend = self._pending_fused_mlp
+            activation_storage, activation_rank, fp8_backend, fp8_input = self._pending_fused_mlp
             self._pending_fused_mlp = None
-            enabled = self.enable_fused_mlp(activation_storage, activation_rank, fp8_backend)
+            enabled = self.enable_fused_mlp(activation_storage, activation_rank, fp8_backend, fp8_input)
             if enabled == 0:
                 raise RuntimeError("deferred fused MLP activation found no eligible modules after apply_to")
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import torch
@@ -16,6 +17,8 @@ from .fp8_kernels import (
 
 FP8_ACTIVATION_DTYPE = torch.float8_e4m3fn
 _LOW_RANK_BASIS_CACHE: dict[tuple[str, int, int], torch.Tensor] = {}
+_FP8_BACKEND_LOGGED: set[tuple[str, str, bool]] = set()
+logger = logging.getLogger(__name__)
 
 
 def pack_rowwise_fp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -40,11 +43,27 @@ def _pack_fp8_with_backend(x: torch.Tensor, backend: str) -> tuple[torch.Tensor,
     if backend in ("auto", "triton") and TRITON_AVAILABLE and x.is_cuda:
         try:
             quantized, scale = pack_rowwise_fp8_triton(x)
+            log_key = (backend, "triton", bool(x.is_cuda))
+            if log_key not in _FP8_BACKEND_LOGGED:
+                logger.info("fused MLP FP8 activation backend selected: triton")
+                _FP8_BACKEND_LOGGED.add(log_key)
             return quantized, scale, "triton"
-        except Exception:
+        except torch.cuda.OutOfMemoryError:
+            # An OOM is a real capacity failure, not a backend capability
+            # probe. Do not hide it by retrying the larger eager path.
+            raise
+        except Exception as error:
             if backend == "triton":
                 raise
+            log_key = (backend, "eager", bool(x.is_cuda))
+            if log_key not in _FP8_BACKEND_LOGGED:
+                logger.warning("fused MLP FP8 Triton pack failed; falling back to eager: %s", error)
+                _FP8_BACKEND_LOGGED.add(log_key)
     quantized, scale = pack_rowwise_fp8(x)
+    log_key = (backend, "eager", bool(x.is_cuda))
+    if log_key not in _FP8_BACKEND_LOGGED:
+        logger.info("fused MLP FP8 activation backend selected: eager")
+        _FP8_BACKEND_LOGGED.add(log_key)
     return quantized, scale, "eager"
 
 
@@ -124,6 +143,7 @@ class _FusedGELUMLP(torch.autograd.Function):
         activation_storage: str,
         low_rank_rank: int,
         fp8_backend: str,
+        store_input_fp8: bool,
     ) -> torch.Tensor:
         _validate_linear_shapes(x, base1, down1, up1)
         if base2.requires_grad:
@@ -149,12 +169,35 @@ class _FusedGELUMLP(torch.autograd.Function):
         else:
             raise ValueError(f"unsupported activation storage mode: {activation_storage}")
 
-        ctx.save_for_backward(x, low_rank1, stored_pre, pre_scale, low_rank2, base1, down1, up1, base2, down2, up2)
+        if store_input_fp8:
+            if activation_storage != "fp8":
+                raise ValueError("FP8 input storage is only supported with FP8 MLP activation storage")
+            stored_x, x_scale, input_fp8_backend = _pack_fp8_with_backend(x, fp8_backend)
+        else:
+            stored_x, x_scale, input_fp8_backend = x, x.new_empty((0,)), "eager"
+
+        ctx.save_for_backward(
+            stored_x,
+            x_scale,
+            low_rank1,
+            stored_pre,
+            pre_scale,
+            low_rank2,
+            base1,
+            down1,
+            up1,
+            base2,
+            down2,
+            up2,
+        )
         ctx.scale1 = float(scale1)
         ctx.scale2 = float(scale2)
         ctx.activation_storage = activation_storage
         ctx.low_rank_rank = int(low_rank_rank)
         ctx.fp8_backend = selected_fp8_backend
+        ctx.input_storage = "fp8" if store_input_fp8 else "original"
+        ctx.input_fp8_backend = input_fp8_backend
+        ctx.input_dtype = x.dtype
         ctx.pre_dtype = pre_gelu.dtype
         ctx.autocast_enabled = torch.is_autocast_enabled(x.device.type)
         ctx.compute_dtype = output.dtype
@@ -162,7 +205,15 @@ class _FusedGELUMLP(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx: Any, grad_output: torch.Tensor):
-        x, low_rank1, stored_pre, pre_scale, low_rank2, base1, down1, up1, base2, down2, up2 = ctx.saved_tensors
+        stored_x, x_scale, low_rank1, stored_pre, pre_scale, low_rank2, base1, down1, up1, base2, down2, up2 = (
+            ctx.saved_tensors
+        )
+        if ctx.input_storage == "fp8" and ctx.input_fp8_backend == "triton":
+            x = unpack_rowwise_fp8_triton(stored_x, x_scale, ctx.input_dtype)
+        elif ctx.input_storage == "fp8":
+            x = unpack_rowwise_fp8(stored_x, x_scale, ctx.input_dtype)
+        else:
+            x = stored_x
         if ctx.activation_storage == "fp8" and ctx.fp8_backend == "triton":
             pre_gelu = None
         elif ctx.activation_storage == "fp8":
@@ -234,6 +285,7 @@ class _FusedGELUMLP(torch.autograd.Function):
             None,
             None,
             None,
+            None,
         )
 
 
@@ -263,6 +315,7 @@ def fused_gelu_mlp(
         "bf16",
         0,
         "eager",
+        False,
     )
 
 
@@ -277,8 +330,9 @@ def fused_gelu_mlp_fp8(
     lora_up2: torch.Tensor,
     scale2: float,
     backend: str = "auto",
+    store_input_fp8: bool = False,
 ) -> torch.Tensor:
-    """Same MLP, storing only the wide pre-GELU activation as rowwise FP8."""
+    """Same MLP with optional row-wise FP8 storage for pre-GELU and input."""
 
     return _FusedGELUMLP.apply(
         x,
@@ -293,6 +347,7 @@ def fused_gelu_mlp_fp8(
         "fp8",
         0,
         backend,
+        bool(store_input_fp8),
     )
 
 
@@ -323,4 +378,5 @@ def fused_gelu_mlp_lowrank(
         "lowrank",
         int(rank),
         "eager",
+        False,
     )
