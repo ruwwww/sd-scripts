@@ -162,6 +162,44 @@ comparison.
 A 10-step soak (after 5 warmup steps) measured 1,567 ms/step with unchanged
 allocated/reserved memory, finite gradients, and no allocator growth.
 
+### Recipe 2b: fastest safe path with per-block `torch.compile`
+
+Anima already supports per-block `torch.compile`. On the same target, combining
+it with the direct Triton FP8 path makes checkpointing much cheaper: compiled
+count 1 is faster than the uncompiled count 8 recipe while retaining a usable
+memory margin.
+
+```bash
+--selective_checkpointing=count \
+--checkpoint_blocks=1 \
+--compile \
+--compile_mode=default \
+--compile_cache_size_limit=32 \
+--fused_lora \
+--fused_mlp \
+--fused_mlp_storage=fp8 \
+--fused_mlp_fp8_backend=triton \
+--fused_mlp_fp8_direct_backward
+```
+
+The first pass through each resolution bucket is slower because Inductor
+compiles the block. Keep `--compile_mode=default`; `max-autotune` is not a good
+fit for this 36-SM GPU. With a multi-resolution dataset, raise the compile
+cache limit and expect one compilation per new shape.
+
+| Compiled checkpoint count | Step ms | Peak allocated | Actual GPU headroom | Decision |
+| ---: | ---: | ---: | ---: | --- |
+| 0 | 1,088 | 13,479 MiB | 2.31 GiB | reject |
+| **1** | **1,134** | **12,701 MiB** | **3.07 GiB** | **fastest safe** |
+| 4 | 1,223 | 11,829 MiB | 3.93 GiB | conservative |
+| 8 | 1,354 | 10,666 MiB | 5.06 GiB | maximum margin |
+
+The count-1 and count-8 compiled runs had maximum loss difference `0.00258`
+and maximum relative gradient-norm difference `0.15%` over the 10-step probe.
+These are short fixed-seed measurements, so validate a real dataset before
+making compile count-1 your unattended default. If the margin is not enough,
+use count 4.
+
 ## Recipe 3: low-rank activation storage (research mode)
 
 This mode stores a randomized rank-`r` approximation of the pre-GELU state.
@@ -235,7 +273,8 @@ memory budget:
 | --- | --- |
 | Match ordinary training dynamics | BF16 fused, 12 blocks |
 | More headroom | FP8 Triton, 12 blocks |
-| Best tested safe throughput with enough VRAM | FP8 Triton direct backward, 8 blocks |
+| Best tested safe throughput with enough VRAM | FP8 Triton direct backward + `torch.compile`, 1 block |
+| More conservative compiled recipe | FP8 Triton direct backward + `torch.compile`, 4 blocks |
 | Research tradeoff for extra compression | Low-rank rank 64, 7 blocks |
 | OOM after enabling a recipe | Keep the recipe and add 2–4 checkpointed blocks |
 

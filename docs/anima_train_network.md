@@ -227,6 +227,8 @@ For LoRA training, use `network_reg_lrs` in `--network_args` instead. See [Secti
   - Experimental Triton-only path: computes the LoRA second-projection gradient directly from the FP8 pre-GELU cache without materializing the full BF16 GELU activation. Requires `--fused_mlp_storage=fp8`; keep it paired with `--fused_mlp_fp8_backend=triton` while validating a new GPU/runtime.
 * `--fused_mlp_rank=<integer>`
   - Rank for `--fused_mlp_storage=lowrank`. Start at 64 and validate numerical and visual behavior before using a lower rank.
+* `--compile --compile_mode=default --compile_cache_size_limit=32`
+  - Optional per-block Inductor compilation. For the tested RTX 5060 Ti target, combine with direct Triton FP8 and checkpoint count 1 for speed, or count 4 for more memory margin. The first iteration of each resolution bucket compiles and is slower.
 
 * `--blocks_to_swap=<integer>`
   - Number of Transformer blocks to swap between CPU and GPU. More blocks reduce VRAM but slow training. Maximum values depend on model size:
