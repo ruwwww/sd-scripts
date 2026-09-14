@@ -109,6 +109,87 @@ if TRITON_AVAILABLE:
         tl.store(activated_ptr + row * activated_stride + columns, activated, mask=mask)
         tl.store(grad_pre_ptr + row * grad_pre_stride + columns, grad_pre, mask=mask)
 
+    @triton.jit
+    def _dequantize_gelu_grad_pre_fp8_kernel(
+        q_ptr,
+        scale_ptr,
+        grad_activated_ptr,
+        grad_pre_ptr,
+        n_columns,
+        q_stride,
+        grad_stride,
+        grad_pre_stride,
+        BLOCK: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        columns = tl.arange(0, BLOCK)
+        mask = columns < n_columns
+        quantized = tl.load(q_ptr + row * q_stride + columns, mask=mask, other=0.0).to(tl.float32)
+        scale = tl.load(scale_ptr + row).to(tl.float32)
+        pre = quantized * scale
+        grad_activated = tl.load(
+            grad_activated_ptr + row * grad_stride + columns,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+
+        inv_sqrt_two = 0.7071067811865476
+        inv_sqrt_two_pi = 0.3989422804014327
+        cdf = 0.5 * (1.0 + tl.erf(pre * inv_sqrt_two))
+        derivative = cdf + pre * tl.exp(-0.5 * pre * pre) * inv_sqrt_two_pi
+        tl.store(grad_pre_ptr + row * grad_pre_stride + columns, grad_activated * derivative, mask=mask)
+
+    @triton.jit
+    def _grad_down2_from_fp8_kernel(
+        q_ptr,
+        scale_ptr,
+        grad_low_rank_ptr,
+        output_ptr,
+        n_rows,
+        n_columns,
+        rank,
+        q_stride,
+        grad_low_stride_rows,
+        grad_low_stride_rank,
+        output_stride_rank,
+        output_stride_columns,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+        rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        columns = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+        for row_start in range(0, n_rows, BLOCK_K):
+            row_offsets = row_start + tl.arange(0, BLOCK_K)
+            row_mask = row_offsets < n_rows
+            q_mask = row_mask[:, None] & (columns[None, :] < n_columns)
+            quantized = tl.load(
+                q_ptr + row_offsets[:, None] * q_stride + columns[None, :],
+                mask=q_mask,
+                other=0.0,
+            ).to(tl.float32)
+            scales = tl.load(scale_ptr + row_offsets, mask=row_mask, other=0.0).to(tl.float32)
+            pre = quantized * scales[:, None]
+            activated = pre * (0.5 * (1.0 + tl.erf(pre * 0.7071067811865476)))
+            grad_low_rank = tl.load(
+                grad_low_rank_ptr
+                + row_offsets[None, :] * grad_low_stride_rows
+                + rows[:, None] * grad_low_stride_rank,
+                mask=(rows[:, None] < rank) & row_mask[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            acc += tl.dot(grad_low_rank, activated)
+
+        tl.store(
+            output_ptr + rows[:, None] * output_stride_rank + columns[None, :] * output_stride_columns,
+            acc,
+            mask=(rows[:, None] < rank) & (columns[None, :] < n_columns),
+        )
+
 
 def _can_use_triton(matrix: torch.Tensor, *, output_dtype: torch.dtype | None = None) -> bool:
     return bool(
@@ -203,6 +284,75 @@ def dequantize_gelu_backward_fp8_triton(
         num_warps=8 if block >= 1024 else 4,
     )
     return activated.reshape_as(grad_activated), grad_pre.reshape_as(grad_activated)
+
+
+def dequantize_gelu_grad_pre_fp8_triton(
+    quantized: torch.Tensor,
+    scale: torch.Tensor,
+    grad_activated: torch.Tensor,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Dequantize FP8 pre-GELU and write only the GELU input gradient."""
+
+    q_matrix = quantized.reshape(-1, quantized.shape[-1])
+    grad_matrix = grad_activated.reshape(-1, grad_activated.shape[-1])
+    if not _can_use_triton(q_matrix, output_dtype=dtype) or not grad_matrix.is_contiguous():
+        raise RuntimeError("Triton FP8 GELU gradient requires contiguous CUDA matrices")
+    scale_matrix = scale.reshape(-1).contiguous()
+    grad_pre = torch.empty_like(grad_matrix, dtype=grad_activated.dtype)
+    block = _next_power_of_two(q_matrix.shape[-1])
+    _dequantize_gelu_grad_pre_fp8_kernel[(q_matrix.shape[0],)](
+        q_matrix,
+        scale_matrix,
+        grad_matrix,
+        grad_pre,
+        q_matrix.shape[-1],
+        q_matrix.stride(0),
+        grad_matrix.stride(0),
+        grad_pre.stride(0),
+        BLOCK=block,
+        num_warps=8 if block >= 1024 else 4,
+    )
+    return grad_pre.reshape_as(grad_activated)
+
+
+def grad_down2_from_fp8_triton(
+    quantized: torch.Tensor,
+    scale: torch.Tensor,
+    grad_low_rank: torch.Tensor,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Compute ``grad_low_rank.T @ GELU(dequantized_pre)`` without materializing GELU."""
+
+    q_matrix = quantized.reshape(-1, quantized.shape[-1])
+    grad_matrix = grad_low_rank.reshape(-1, grad_low_rank.shape[-1])
+    if not _can_use_triton(q_matrix, output_dtype=dtype) or not grad_matrix.is_contiguous():
+        raise RuntimeError("Triton FP8 direct dDown2 requires contiguous CUDA matrices")
+    rows, columns = q_matrix.shape
+    rank = grad_matrix.shape[-1]
+    output = torch.empty((rank, columns), device=q_matrix.device, dtype=dtype)
+    block_m = _next_power_of_two(rank)
+    block_n = 128
+    block_k = 128
+    _grad_down2_from_fp8_kernel[(triton.cdiv(rank, block_m), triton.cdiv(columns, block_n))](
+        q_matrix,
+        scale.reshape(-1).contiguous(),
+        grad_matrix,
+        output,
+        rows,
+        columns,
+        rank,
+        q_matrix.stride(0),
+        grad_matrix.stride(0),
+        grad_matrix.stride(1),
+        output.stride(0),
+        output.stride(1),
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        num_warps=4,
+    )
+    return output
 
 
 def kernel_metadata() -> dict[str, Any]:

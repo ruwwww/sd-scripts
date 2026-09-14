@@ -223,6 +223,8 @@ For LoRA training, use `network_reg_lrs` in `--network_args` instead. See [Secti
   - Selects the FP8 activation-cache implementation. `auto` prefers fused Triton kernels when available; `eager` is useful for diagnostics but may be slower; `triton` requires a compatible Triton/CUDA runtime.
 * `--fused_mlp_fp8_input`
   - Experimental: also stores the custom-VJP MLP input `X` as row-wise FP8. This saves additional memory but introduces extra quantization in the LoRA input-gradient path; it is not part of the default FP8 recipe.
+* `--fused_mlp_fp8_direct_backward`
+  - Experimental Triton-only path: computes the LoRA second-projection gradient directly from the FP8 pre-GELU cache without materializing the full BF16 GELU activation. Requires `--fused_mlp_storage=fp8`; keep it paired with `--fused_mlp_fp8_backend=triton` while validating a new GPU/runtime.
 * `--fused_mlp_rank=<integer>`
   - Rank for `--fused_mlp_storage=lowrank`. Start at 64 and validate numerical and visual behavior before using a lower rank.
 

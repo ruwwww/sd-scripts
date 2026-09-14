@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+import pytest
 import torch
 import torch.nn.functional as F
 
 from networks.fused_lora import fused_lora_linear
 from networks.fused_mlp import fused_gelu_mlp, fused_gelu_mlp_fp8, fused_gelu_mlp_lowrank
+from networks.fp8_kernels import (
+    TRITON_AVAILABLE,
+    dequantize_gelu_grad_pre_fp8_triton,
+    grad_down2_from_fp8_triton,
+    pack_rowwise_fp8_triton,
+    unpack_rowwise_fp8_triton,
+)
 from networks.lora_anima import LoRAModule
 
 
@@ -123,3 +131,37 @@ def test_lora_module_fused_path_is_opt_in_and_trainable():
     assert lora.lora_down.weight.grad is not None
     assert lora.lora_up.weight.grad is not None
     assert x.grad is not None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not TRITON_AVAILABLE, reason="CUDA Triton is required")
+def test_direct_fp8_backward_matches_dequantized_reference():
+    torch.manual_seed(987)
+    rows, columns, rank = 257, 2048, 16
+    pre = torch.randn(rows, columns, device="cuda", dtype=torch.bfloat16).contiguous()
+    quantized, scale = pack_rowwise_fp8_triton(pre)
+    dequantized = unpack_rowwise_fp8_triton(quantized, scale, torch.bfloat16)
+    low_rank = torch.randn(rows, rank, device="cuda", dtype=torch.bfloat16).contiguous()
+    grad_activated = torch.randn(rows, columns, device="cuda", dtype=torch.bfloat16).contiguous()
+
+    candidate_down = grad_down2_from_fp8_triton(quantized, scale, low_rank, torch.bfloat16)
+    reference_down = torch.mm(
+        low_rank.float().transpose(0, 1),
+        F.gelu(dequantized.float(), approximate="none"),
+    ).to(torch.bfloat16)
+    candidate_pre = dequantize_gelu_grad_pre_fp8_triton(
+        quantized,
+        scale,
+        grad_activated,
+        torch.bfloat16,
+    )
+    reference_pre = torch.ops.aten.gelu_backward(grad_activated, dequantized, approximate="none")
+
+    assert torch.isfinite(candidate_down).all()
+    assert torch.isfinite(candidate_pre).all()
+    assert (
+        float(F.cosine_similarity(candidate_down.float().flatten(), reference_down.float().flatten(), dim=0))
+        > 0.9999
+    )
+    assert (
+        float(F.cosine_similarity(candidate_pre.float().flatten(), reference_pre.float().flatten(), dim=0)) > 0.9999
+    )

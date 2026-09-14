@@ -180,6 +180,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
                 getattr(args, "fused_mlp_rank", 64),
                 getattr(args, "fused_mlp_fp8_backend", "auto"),
                 getattr(args, "fused_mlp_fp8_input", False),
+                getattr(args, "fused_mlp_fp8_direct_backward", False),
             )
             if enabled == 0:
                 raise RuntimeError("--fused_mlp found no eligible dropout-free LoRA GELU MLP modules")
@@ -542,6 +543,11 @@ def setup_parser() -> argparse.ArgumentParser:
         "--fused_mlp_fp8_input",
         action="store_true",
         help="experimental: also store the MLP input X as row-wise FP8 for the LoRA backward",
+    )
+    parser.add_argument(
+        "--fused_mlp_fp8_direct_backward",
+        action="store_true",
+        help="experimental: compute dDown2 directly from the FP8 cache without materializing GELU activation",
     )
     return parser
 

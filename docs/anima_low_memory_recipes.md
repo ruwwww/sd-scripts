@@ -136,6 +136,32 @@ target dataset before enabling it for a long run; the additional quantization
 only affects the LoRA input-gradient path, but it is still a reduced-precision
 backward.
 
+### Optional R&D: direct backward from the FP8 cache
+
+The Triton backend also has an experimental
+`--fused_mlp_fp8_direct_backward` path. It computes the LoRA `dDown2` product
+directly from the row-wise FP8 pre-GELU cache and writes only the GELU input
+gradient. This avoids allocating the full BF16 GELU activation during
+backward; it does not use recomputation and it does not change the forward
+GEMMs. It requires `--fused_mlp_storage=fp8` and the Triton backend.
+
+```bash
+--fused_mlp_storage=fp8 \
+--fused_mlp_fp8_backend=triton \
+--fused_mlp_fp8_direct_backward
+```
+
+On the same target, after 3 warmup steps and 5 measured steps, count 8 was
+stable at about 1,566 ms/step and 12,944 MiB peak allocation, with 3.16 GiB
+headroom to the benchmark budget. Adding `--fused_mlp_fp8_input` reduced the
+peak to about 12,810 MiB and measured 1,567 ms/step, but also quantizes the
+private input used by the LoRA `dDown1` gradient. Keep the input flag off for
+the conservative recipe; use it only after a fixed-seed trajectory and image
+comparison.
+
+A 10-step soak (after 5 warmup steps) measured 1,567 ms/step with unchanged
+allocated/reserved memory, finite gradients, and no allocator growth.
+
 ## Recipe 3: low-rank activation storage (research mode)
 
 This mode stores a randomized rank-`r` approximation of the pre-GELU state.
@@ -209,9 +235,23 @@ memory budget:
 | --- | --- |
 | Match ordinary training dynamics | BF16 fused, 12 blocks |
 | More headroom | FP8 Triton, 12 blocks |
-| Best tested throughput with enough VRAM | FP8 Triton, 8 blocks |
+| Best tested safe throughput with enough VRAM | FP8 Triton direct backward, 8 blocks |
 | Research tradeoff for extra compression | Low-rank rank 64, 7 blocks |
 | OOM after enabling a recipe | Keep the recipe and add 2–4 checkpointed blocks |
+
+The direct-backward checkpoint sweep on the target was:
+
+| Checkpoint blocks | Step ms | Peak allocated | Budget headroom | Decision |
+| ---: | ---: | ---: | ---: | --- |
+| 6 | 1,528 | 13,751 MiB | 2.37 GiB | too little margin |
+| 7 + FP8 input | 1,547 | 13,194 MiB | 2.91 GiB | aggressive, not default |
+| 8 | 1,566 | 12,944 MiB | 3.16 GiB | recommended |
+| 8 + FP8 input | 1,567 | 12,810 MiB | 3.29 GiB | conservative memory extension |
+
+The safety gate used here is at least 3 GiB headroom to a 15.8 GiB training
+budget. Count 7 is likely to run on this exact setup, but the margin is too
+small to call it robust against allocator variation, longer sequences, or
+other training options.
 
 For a 28-block model, `--checkpoint_blocks=N` selects approximately `N`
 evenly spaced blocks. It implies gradient checkpointing. `--selective_checkpointing=full`
@@ -248,7 +288,7 @@ frozen-base LoRA topology and the module names used by Anima LoRA loading.
 
 * `networks/fused_lora.py` — explicit-VJP LoRA Linear.
 * `networks/fused_mlp.py` — BF16, FP8, and low-rank activation storage.
-* `networks/fp8_kernels.py` — Triton row-wise pack, unpack, and fused GELU backward kernels.
+* `networks/fp8_kernels.py` — Triton row-wise pack, unpack, fused GELU backward, and direct dDown2 kernels.
 * `library/selective_checkpointing.py` — block checkpoint placement.
 * [PyTorch saved-tensor hooks](https://docs.pytorch.org/tutorials/intermediate/autograd_saved_tensors_hooks_tutorial.html)
   — background on activation packing.

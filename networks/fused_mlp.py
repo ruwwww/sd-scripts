@@ -11,6 +11,8 @@ import torch.nn.functional as F
 from .fp8_kernels import (
     TRITON_AVAILABLE,
     dequantize_gelu_backward_fp8_triton,
+    dequantize_gelu_grad_pre_fp8_triton,
+    grad_down2_from_fp8_triton,
     pack_rowwise_fp8_triton,
     unpack_rowwise_fp8_triton,
 )
@@ -144,6 +146,7 @@ class _FusedGELUMLP(torch.autograd.Function):
         low_rank_rank: int,
         fp8_backend: str,
         store_input_fp8: bool,
+        direct_fp8_backward: bool,
     ) -> torch.Tensor:
         _validate_linear_shapes(x, base1, down1, up1)
         if base2.requires_grad:
@@ -175,6 +178,8 @@ class _FusedGELUMLP(torch.autograd.Function):
             stored_x, x_scale, input_fp8_backend = _pack_fp8_with_backend(x, fp8_backend)
         else:
             stored_x, x_scale, input_fp8_backend = x, x.new_empty((0,)), "eager"
+        if direct_fp8_backward and (activation_storage != "fp8" or selected_fp8_backend != "triton"):
+            raise ValueError("direct FP8 backward requires the Triton FP8 activation backend")
 
         ctx.save_for_backward(
             stored_x,
@@ -197,6 +202,7 @@ class _FusedGELUMLP(torch.autograd.Function):
         ctx.fp8_backend = selected_fp8_backend
         ctx.input_storage = "fp8" if store_input_fp8 else "original"
         ctx.input_fp8_backend = input_fp8_backend
+        ctx.direct_fp8_backward = bool(direct_fp8_backward)
         ctx.input_dtype = x.dtype
         ctx.pre_dtype = pre_gelu.dtype
         ctx.autocast_enabled = torch.is_autocast_enabled(x.device.type)
@@ -208,12 +214,6 @@ class _FusedGELUMLP(torch.autograd.Function):
         stored_x, x_scale, low_rank1, stored_pre, pre_scale, low_rank2, base1, down1, up1, base2, down2, up2 = (
             ctx.saved_tensors
         )
-        if ctx.input_storage == "fp8" and ctx.input_fp8_backend == "triton":
-            x = unpack_rowwise_fp8_triton(stored_x, x_scale, ctx.input_dtype)
-        elif ctx.input_storage == "fp8":
-            x = unpack_rowwise_fp8(stored_x, x_scale, ctx.input_dtype)
-        else:
-            x = stored_x
         if ctx.activation_storage == "fp8" and ctx.fp8_backend == "triton":
             pre_gelu = None
         elif ctx.activation_storage == "fp8":
@@ -225,7 +225,7 @@ class _FusedGELUMLP(torch.autograd.Function):
         scale1 = ctx.scale1
         scale2 = ctx.scale2
 
-        x_2d = x.reshape(-1, x.shape[-1])
+        x_2d = None if ctx.input_storage == "fp8" else stored_x.reshape(-1, stored_x.shape[-1])
         low_rank1_2d = low_rank1.reshape(-1, low_rank1.shape[-1])
         pre_gelu_2d = None if pre_gelu is None else pre_gelu.reshape(-1, pre_gelu.shape[-1])
         low_rank2_2d = low_rank2.reshape(-1, low_rank2.shape[-1])
@@ -237,32 +237,60 @@ class _FusedGELUMLP(torch.autograd.Function):
             grad_activated = torch.mm(grad_output_2d, base2)
             grad_activated.addmm_(grad_low_rank2, down2)
             if ctx.activation_storage == "fp8" and ctx.fp8_backend == "triton":
-                activated_2d, grad_pre_gelu = dequantize_gelu_backward_fp8_triton(
-                    stored_pre,
-                    pre_scale,
-                    grad_activated,
-                    ctx.pre_dtype,
-                )
+                if ctx.direct_fp8_backward:
+                    grad_pre_gelu = dequantize_gelu_grad_pre_fp8_triton(
+                        stored_pre,
+                        pre_scale,
+                        grad_activated,
+                        ctx.pre_dtype,
+                    )
+                    grad_down2 = grad_down2_from_fp8_triton(
+                        stored_pre,
+                        pre_scale,
+                        low_rank2_2d,
+                        down2.dtype,
+                    )
+                    activated_2d = None
+                else:
+                    activated_2d, grad_pre_gelu = dequantize_gelu_backward_fp8_triton(
+                        stored_pre,
+                        pre_scale,
+                        grad_activated,
+                        ctx.pre_dtype,
+                    )
             else:
                 activated_2d = F.gelu(pre_gelu_2d, approximate="none")
                 grad_pre_gelu = torch.ops.aten.gelu_backward(grad_activated, pre_gelu_2d, approximate="none")
-            grad_down2 = torch.mm(grad_low_rank2.transpose(0, 1), activated_2d)
+            if activated_2d is not None:
+                grad_down2 = torch.mm(grad_low_rank2.transpose(0, 1), activated_2d)
+            # The activated state is no longer needed after dDown2. Release it
+            # before restoring an optional FP8 input, keeping peak backward
+            # memory from overlapping two wide BF16 temporaries.
+            if activated_2d is not None:
+                del activated_2d
 
             grad_up1 = torch.mm(grad_pre_gelu.transpose(0, 1), low_rank1_2d).mul_(scale1)
             grad_low_rank1 = torch.mm(grad_pre_gelu, up1).mul_(scale1)
-            grad_down1 = torch.mm(grad_low_rank1.transpose(0, 1), x_2d)
+            vjp_x_2d = x_2d
+            if vjp_x_2d is None:
+                if ctx.input_fp8_backend == "triton":
+                    restored_x = unpack_rowwise_fp8_triton(stored_x, x_scale, ctx.input_dtype)
+                else:
+                    restored_x = unpack_rowwise_fp8(stored_x, x_scale, ctx.input_dtype)
+                vjp_x_2d = restored_x.reshape(-1, restored_x.shape[-1])
+            grad_down1 = torch.mm(grad_low_rank1.transpose(0, 1), vjp_x_2d)
             grad_x = torch.mm(grad_pre_gelu, base1)
             grad_x.addmm_(grad_low_rank1, down1)
             return grad_x, grad_down1, grad_up1, grad_down2, grad_up2
 
         if ctx.autocast_enabled:
-            with torch.autocast(device_type=x.device.type, dtype=ctx.compute_dtype):
+            with torch.autocast(device_type=stored_x.device.type, dtype=ctx.compute_dtype):
                 grad_x, grad_down1, grad_up1, grad_down2, grad_up2 = vjp()
         else:
             grad_x, grad_down1, grad_up1, grad_down2, grad_up2 = vjp()
 
-        if grad_x.dtype != x.dtype:
-            grad_x = grad_x.to(dtype=x.dtype)
+        if grad_x.dtype != ctx.input_dtype:
+            grad_x = grad_x.to(dtype=ctx.input_dtype)
         if grad_down1.dtype != down1.dtype:
             grad_down1 = grad_down1.to(dtype=down1.dtype)
         if grad_up1.dtype != up1.dtype:
@@ -273,7 +301,7 @@ class _FusedGELUMLP(torch.autograd.Function):
             grad_up2 = grad_up2.to(dtype=up2.dtype)
 
         return (
-            grad_x.reshape_as(x),
+            grad_x.reshape_as(stored_x),
             None,
             grad_down1.reshape_as(down1),
             grad_up1.reshape_as(up1),
@@ -281,6 +309,7 @@ class _FusedGELUMLP(torch.autograd.Function):
             None,
             grad_down2.reshape_as(down2),
             grad_up2.reshape_as(up2),
+            None,
             None,
             None,
             None,
@@ -316,6 +345,7 @@ def fused_gelu_mlp(
         0,
         "eager",
         False,
+        False,
     )
 
 
@@ -331,6 +361,7 @@ def fused_gelu_mlp_fp8(
     scale2: float,
     backend: str = "auto",
     store_input_fp8: bool = False,
+    direct_fp8_backward: bool = False,
 ) -> torch.Tensor:
     """Same MLP with optional row-wise FP8 storage for pre-GELU and input."""
 
@@ -348,6 +379,7 @@ def fused_gelu_mlp_fp8(
         0,
         backend,
         bool(store_input_fp8),
+        bool(direct_fp8_backward),
     )
 
 
@@ -378,5 +410,6 @@ def fused_gelu_mlp_lowrank(
         "lowrank",
         int(rank),
         "eager",
+        False,
         False,
     )
