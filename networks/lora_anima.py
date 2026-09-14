@@ -3,9 +3,13 @@ import ast
 import math
 import os
 import re
+import types
+import weakref
 from typing import Dict, List, Optional, Tuple, Type, Union
 import torch
 from library.utils import setup_logging
+from .fused_lora import fused_lora_linear
+from .fused_mlp import fused_gelu_mlp, fused_gelu_mlp_fp8, fused_gelu_mlp_lowrank
 
 import logging
 
@@ -69,6 +73,7 @@ class LoRAModule(torch.nn.Module):
         self.dropout = dropout
         self.rank_dropout = rank_dropout
         self.module_dropout = module_dropout
+        self._use_fused_lora = False
 
     def apply_to(self):
         self.org_forward = self.org_module.forward
@@ -76,7 +81,36 @@ class LoRAModule(torch.nn.Module):
 
         del self.org_module
 
+    def enable_fused_lora(self):
+        """Opt into the explicit-VJP path for dropout-free Linear modules."""
+
+        self._use_fused_lora = True
+        return self
+
+    def disable_fused_lora(self):
+        self._use_fused_lora = False
+        return self
+
     def forward(self, x):
+        if (
+            self._use_fused_lora
+            and self.training
+            and self.dropout is None
+            and self.rank_dropout is None
+            and self.module_dropout is None
+            and isinstance(self.lora_down, torch.nn.Linear)
+            and isinstance(self.lora_up, torch.nn.Linear)
+        ):
+            base_module = getattr(self.org_forward, "__self__", None)
+            if isinstance(base_module, torch.nn.Linear) and base_module.bias is None:
+                return fused_lora_linear(
+                    x,
+                    base_module.weight,
+                    self.lora_down.weight,
+                    self.lora_up.weight,
+                    self.multiplier * self.scale,
+                )
+
         org_forwarded = self.org_forward(x)
 
         # module dropout
@@ -408,6 +442,9 @@ class LoRANetwork(torch.nn.Module):
         verbose: Optional[bool] = False,
     ) -> None:
         super().__init__()
+        self._unet_ref = weakref.ref(unet) if unet is not None else None
+        self._fused_mlp_bindings = []
+        self._pending_fused_mlp = None
         self.multiplier = multiplier
         self.lora_dim = lora_dim
         self.alpha = alpha
@@ -570,6 +607,146 @@ class LoRANetwork(torch.nn.Module):
         for lora in self.text_encoder_loras + self.unet_loras:
             lora.enabled = is_enabled
 
+    def enable_fused_lora(self):
+        count = 0
+        # During Kohya setup this method is called before apply_to() registers
+        # LoRA modules as children. The explicit lists work in both phases.
+        for module in self.text_encoder_loras + self.unet_loras:
+            if isinstance(module, LoRAModule):
+                module.enable_fused_lora()
+                count += 1
+        logger.info(f"enabled explicit-VJP LoRA Linear path for {count} modules")
+        return count
+
+    def disable_fused_lora(self):
+        for module in self.text_encoder_loras + self.unet_loras:
+            if isinstance(module, LoRAModule):
+                module.disable_fused_lora()
+
+    def enable_fused_mlp(
+        self,
+        activation_storage: str = "bf16",
+        activation_rank: int = 64,
+        fp8_backend: str = "auto",
+    ):
+        """Opt into the explicit-VJP Linear-GELU-Linear path."""
+
+        if activation_storage not in ("bf16", "fp8", "lowrank"):
+            raise ValueError(f"unsupported fused MLP activation storage: {activation_storage}")
+        if fp8_backend not in ("auto", "eager", "triton"):
+            raise ValueError(f"unsupported FP8 kernel backend: {fp8_backend}")
+        if activation_storage == "bf16":
+            fused_op = fused_gelu_mlp
+        elif activation_storage == "fp8":
+            fused_op = fused_gelu_mlp_fp8
+        else:
+            if int(activation_rank) <= 0:
+                raise ValueError("low-rank activation rank must be positive")
+            fused_op = fused_gelu_mlp_lowrank
+
+        self.disable_fused_mlp()
+        unet = self._unet_ref() if self._unet_ref is not None else None
+        if unet is None:
+            raise RuntimeError("fused MLP requires the live Anima model reference")
+
+        lora_by_base = {}
+        needs_apply_defer = False
+        for lora in self.unet_loras:
+            org_forward = getattr(lora, "org_forward", None)
+            base_module = getattr(org_forward, "__self__", None)
+            if base_module is None:
+                base_module = getattr(lora, "org_module", None)
+                needs_apply_defer = needs_apply_defer or base_module is not None
+            if base_module is not None:
+                lora_by_base[id(base_module)] = lora
+
+        if needs_apply_defer:
+            # train_network.py invokes post_process_network before apply_to().
+            # Record the request, return the eligible count for validation, and
+            # install the actual bound forwards after org_forward exists.
+            eligible = 0
+            for mlp in unet.modules():
+                if mlp.__class__.__name__ != "GPT2FeedForward":
+                    continue
+                first = lora_by_base.get(id(getattr(mlp, "layer1", None)))
+                second = lora_by_base.get(id(getattr(mlp, "layer2", None)))
+                if first is not None and second is not None:
+                    eligible += 1
+            self._pending_fused_mlp = (activation_storage, int(activation_rank), fp8_backend)
+            logger.info(
+                "deferred explicit-VJP GELU MLP path until LoRA apply_to storage=%s rank=%s eligible=%d",
+                activation_storage,
+                activation_rank if activation_storage == "lowrank" else "n/a",
+                eligible,
+            )
+            return eligible
+
+        enabled = 0
+        for mlp in unet.modules():
+            if mlp.__class__.__name__ != "GPT2FeedForward":
+                continue
+            lora1 = lora_by_base.get(id(getattr(mlp, "layer1", None)))
+            lora2 = lora_by_base.get(id(getattr(mlp, "layer2", None)))
+            if lora1 is None or lora2 is None:
+                continue
+            if any(
+                getattr(lora, field, None) is not None
+                for lora in (lora1, lora2)
+                for field in ("dropout", "rank_dropout", "module_dropout")
+            ):
+                continue
+            base1 = getattr(lora1.org_forward, "__self__", None)
+            base2 = getattr(lora2.org_forward, "__self__", None)
+            if not isinstance(base1, torch.nn.Linear) or not isinstance(base2, torch.nn.Linear):
+                continue
+            if base1.bias is not None or base2.bias is not None:
+                continue
+
+            original_forward = mlp.forward
+
+            def _fused_forward(module, x, first=lora1, second=lora2):
+                base_first = first.org_forward.__self__
+                base_second = second.org_forward.__self__
+                arguments = (
+                    x,
+                    base_first.weight,
+                    first.lora_down.weight,
+                    first.lora_up.weight,
+                    first.multiplier * first.scale,
+                    base_second.weight,
+                    second.lora_down.weight,
+                    second.lora_up.weight,
+                    second.multiplier * second.scale,
+                )
+                # Inference and reentrant checkpoint implementations can call
+                # this path under no_grad; avoid compression when no backward
+                # graph can consume the cache. Kohya's non-reentrant checkpoint
+                # path remains intentionally measured with the cache enabled.
+                if not torch.is_grad_enabled():
+                    return fused_gelu_mlp(*arguments)
+                if activation_storage == "lowrank":
+                    return fused_op(*arguments, int(activation_rank))
+                if activation_storage == "fp8":
+                    return fused_op(*arguments, fp8_backend)
+                return fused_op(*arguments)
+
+            mlp.forward = types.MethodType(_fused_forward, mlp)
+            self._fused_mlp_bindings.append((mlp, original_forward))
+            enabled += 1
+
+        logger.info(
+            "enabled explicit-VJP GELU MLP path storage=%s rank=%s for %d modules",
+            activation_storage,
+            activation_rank if activation_storage == "lowrank" else fp8_backend if activation_storage == "fp8" else "n/a",
+            enabled,
+        )
+        return enabled
+
+    def disable_fused_mlp(self):
+        for module, original_forward in self._fused_mlp_bindings:
+            module.forward = original_forward
+        self._fused_mlp_bindings.clear()
+
     def load_weights(self, file):
         if os.path.splitext(file)[1] == ".safetensors":
             from safetensors.torch import load_file
@@ -582,6 +759,8 @@ class LoRANetwork(torch.nn.Module):
         return info
 
     def apply_to(self, text_encoders, unet, apply_text_encoder=True, apply_unet=True):
+        if unet is not None:
+            self._unet_ref = weakref.ref(unet)
         if apply_text_encoder:
             logger.info(f"enable LoRA for text encoder: {len(self.text_encoder_loras)} modules")
         else:
@@ -595,6 +774,13 @@ class LoRANetwork(torch.nn.Module):
         for lora in self.text_encoder_loras + self.unet_loras:
             lora.apply_to()
             self.add_module(lora.lora_name, lora)
+
+        if self._pending_fused_mlp is not None:
+            activation_storage, activation_rank, fp8_backend = self._pending_fused_mlp
+            self._pending_fused_mlp = None
+            enabled = self.enable_fused_mlp(activation_storage, activation_rank, fp8_backend)
+            if enabled == 0:
+                raise RuntimeError("deferred fused MLP activation found no eligible modules after apply_to")
 
     def is_mergeable(self):
         return True

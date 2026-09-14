@@ -17,6 +17,10 @@ Qwen-Image VAE and Qwen-Image VAE have same architecture, but [official Anima we
 
 This guide assumes you already understand the basics of LoRA training. For common usage and options, see the [train_network.py guide](train_network.md). Some parameters are similar to those in [`sd3_train_network.py`](sd3_train_network.md) and [`flux_train_network.py`](flux_train_network.md).
 
+For tested low-memory recipes using explicit-VJP LoRA, fused MLPs, Triton FP8
+activation storage, and experimental low-rank activation storage, see
+[Anima low-memory LoRA recipes](anima_low_memory_recipes.md).
+
 **Prerequisites:**
 
 * The `sd-scripts` repository has been cloned and the Python environment is ready.
@@ -206,6 +210,19 @@ These options set separate learning rates for each component of the Anima model.
 For LoRA training, use `network_reg_lrs` in `--network_args` instead. See [Section 5.2](#52-regex-based-rank-and-learning-rate-control--正規表現によるランク学習率の制御).
 
 #### Memory and Speed / メモリ・速度関連
+
+* `--selective_checkpointing=<none|full|interleaved|every4|count>` and `--checkpoint_blocks=<integer>`
+  - Opt-in per-block checkpoint placement. `--checkpoint_blocks` selects an exact number of evenly spaced blocks and implies gradient checkpointing. Use the dedicated [low-memory recipe guide](anima_low_memory_recipes.md) for recommended counts.
+* `--fused_lora`
+  - Use the explicit-VJP LoRA Linear path for compatible dropout-free Anima LoRA modules. This is opt-in and preserves the same BF16 compute dtype.
+* `--fused_mlp`
+  - Use the explicit-VJP frozen-base Linear-GELU-Linear path for compatible Anima MLPs. Combine with `--fused_mlp_storage` to choose the saved activation representation.
+* `--fused_mlp_storage=<bf16|fp8|lowrank>`
+  - `bf16` is the exact-storage reference, `fp8` stores the wide pre-GELU backward state as row-wise E4M3 FP8, and `lowrank` stores an experimental randomized rank approximation.
+* `--fused_mlp_fp8_backend=<auto|eager|triton>`
+  - Selects the FP8 activation-cache implementation. `auto` prefers fused Triton kernels when available; `eager` is useful for diagnostics but may be slower; `triton` requires a compatible Triton/CUDA runtime.
+* `--fused_mlp_rank=<integer>`
+  - Rank for `--fused_mlp_storage=lowrank`. Start at 64 and validate numerical and visual behavior before using a lower rank.
 
 * `--blocks_to_swap=<integer>`
   - Number of Transformer blocks to swap between CPU and GPU. More blocks reduce VRAM but slow training. Maximum values depend on model size:

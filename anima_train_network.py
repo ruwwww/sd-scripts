@@ -167,7 +167,22 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         return strategy_anima.AnimaTextEncodingStrategy()
 
     def post_process_network(self, args, accelerator, network, text_encoders, unet):
-        pass
+        if getattr(args, "fused_lora", False):
+            if not hasattr(network, "enable_fused_lora"):
+                raise RuntimeError("--fused_lora requires a network module with explicit-VJP LoRA support")
+            network.enable_fused_lora()
+            logger.info("Anima fused LoRA explicit-VJP path enabled")
+        if getattr(args, "fused_mlp", False):
+            if not hasattr(network, "enable_fused_mlp"):
+                raise RuntimeError("--fused_mlp requires Anima LoRA MLP support")
+            enabled = network.enable_fused_mlp(
+                getattr(args, "fused_mlp_storage", "bf16"),
+                getattr(args, "fused_mlp_rank", 64),
+                getattr(args, "fused_mlp_fp8_backend", "auto"),
+            )
+            if enabled == 0:
+                raise RuntimeError("--fused_mlp found no eligible dropout-free LoRA GELU MLP modules")
+            logger.info("Anima fused GELU MLP explicit-VJP path enabled for %d modules", enabled)
 
     def get_models_for_text_encoding(self, args, accelerator, text_encoders):
         if args.cache_text_encoder_outputs:
@@ -424,9 +439,26 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
     def prepare_unet_with_accelerator(
         self, args: argparse.Namespace, accelerator: Accelerator, unet: torch.nn.Module
     ) -> torch.nn.Module:
-        # The base NetworkTrainer only calls enable_gradient_checkpointing(cpu_offload=True/False),
-        # so we re-apply with unsloth_offload if needed (after base has already enabled it).
-        if self._use_unsloth_offload_checkpointing and args.gradient_checkpointing:
+        # Apply selective checkpointing if requested, otherwise fallback to unsloth or standard
+        if args.selective_checkpointing is not None or args.checkpoint_blocks is not None:
+            from library.selective_checkpointing import apply_selective_checkpointing
+
+            dit = accelerator.unwrap_model(unet) if hasattr(accelerator, "unwrap_model") else unet
+            checkpoint_plan = apply_selective_checkpointing(
+                dit,
+                strategy=args.selective_checkpointing,
+                checkpoint_blocks=args.checkpoint_blocks,
+                cpu_offload=args.cpu_offload_checkpointing,
+                unsloth_offload=args.unsloth_offload_checkpointing,
+            )
+            logger.info(
+                "Anima selective checkpointing: strategy=%s checkpointed=%d/%d indices=%s",
+                checkpoint_plan.strategy,
+                checkpoint_plan.checkpointed_blocks,
+                checkpoint_plan.num_blocks,
+                checkpoint_plan.checkpointed_indices,
+            )
+        elif self._use_unsloth_offload_checkpointing and args.gradient_checkpointing:
             unet.enable_gradient_checkpointing(unsloth_offload=True)
 
         if not self.is_swapping_blocks:
@@ -465,6 +497,46 @@ def setup_parser() -> argparse.ArgumentParser:
         help="offload activations to CPU RAM using async non-blocking transfers (faster than --cpu_offload_checkpointing). "
         "Cannot be used with --cpu_offload_checkpointing or --blocks_to_swap.",
     )
+    parser.add_argument(
+        "--selective_checkpointing",
+        choices=("none", "full", "interleaved", "every4", "count"),
+        default=None,
+        help="opt-in per-block checkpoint placement for Anima; full preserves --gradient_checkpointing behavior",
+    )
+    parser.add_argument(
+        "--checkpoint_blocks",
+        type=int,
+        default=None,
+        help="exact number of evenly-spaced Anima blocks to checkpoint; implies selective count mode",
+    )
+    parser.add_argument(
+        "--fused_lora",
+        action="store_true",
+        help="use the opt-in explicit-VJP LoRA Linear path for dropout-free Anima LoRA modules",
+    )
+    parser.add_argument(
+        "--fused_mlp",
+        action="store_true",
+        help="use the opt-in exact explicit-VJP Linear-GELU-Linear path for Anima LoRA MLP modules",
+    )
+    parser.add_argument(
+        "--fused_mlp_storage",
+        choices=("bf16", "fp8", "lowrank"),
+        default="bf16",
+        help="activation storage for --fused_mlp; fp8 compresses only the wide pre-GELU backward state",
+    )
+    parser.add_argument(
+        "--fused_mlp_rank",
+        type=int,
+        default=64,
+        help="rank used by the experimental lowrank fused MLP activation storage",
+    )
+    parser.add_argument(
+        "--fused_mlp_fp8_backend",
+        choices=("auto", "eager", "triton"),
+        default="auto",
+        help="FP8 activation cache backend; auto uses fused Triton storage kernels when available",
+    )
     return parser
 
 
@@ -474,6 +546,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
     args_util.verify_command_line_training_args(args)
     args = args_util.read_config_from_file(args, parser)
+
+    if args.selective_checkpointing is not None or args.checkpoint_blocks is not None:
+        args.gradient_checkpointing = True
 
     if args.attn_mode == "sdpa":
         args.attn_mode = "torch"  # backward compatibility
