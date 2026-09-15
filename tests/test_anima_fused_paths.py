@@ -165,3 +165,39 @@ def test_direct_fp8_backward_matches_dequantized_reference():
     assert (
         float(F.cosine_similarity(candidate_pre.float().flatten(), reference_pre.float().flatten(), dim=0)) > 0.9999
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not TRITON_AVAILABLE, reason="CUDA Triton is required")
+def test_fused_mlp_direct_fp8_uses_gradient_for_second_down_projection():
+    """The direct path must not use the forward LoRA activation as dDown2."""
+
+    torch.manual_seed(321)
+    device = "cuda"
+    rows, input_dim, hidden_dim, output_dim, rank = 33, 32, 64, 32, 8
+    x = torch.randn(rows, input_dim, device=device, dtype=torch.bfloat16, requires_grad=True)
+    base1 = torch.randn(hidden_dim, input_dim, device=device, dtype=torch.bfloat16)
+    base2 = torch.randn(output_dim, hidden_dim, device=device, dtype=torch.bfloat16)
+    down1 = torch.randn(rank, input_dim, device=device, dtype=torch.bfloat16, requires_grad=True)
+    up1 = torch.zeros(hidden_dim, rank, device=device, dtype=torch.bfloat16, requires_grad=True)
+    down2 = torch.randn(rank, hidden_dim, device=device, dtype=torch.bfloat16, requires_grad=True)
+    # At initialization up2 == 0, so dDown2 must be exactly zero.
+    up2 = torch.zeros(output_dim, rank, device=device, dtype=torch.bfloat16, requires_grad=True)
+    grad_output = torch.randn(rows, output_dim, device=device, dtype=torch.bfloat16)
+
+    output = fused_gelu_mlp_fp8(
+        x,
+        base1,
+        down1,
+        up1,
+        1.0,
+        base2,
+        down2,
+        up2,
+        1.0,
+        backend="triton",
+        direct_fp8_backward=True,
+    )
+    output.backward(grad_output)
+
+    assert down2.grad is not None
+    assert torch.equal(down2.grad, torch.zeros_like(down2.grad))

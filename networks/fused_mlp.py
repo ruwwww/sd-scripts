@@ -232,10 +232,12 @@ class _FusedGELUMLP(torch.autograd.Function):
         grad_output_2d = grad_output.reshape(-1, grad_output.shape[-1])
 
         def vjp():
+            up2_compute = up2.to(grad_output_2d.dtype)
+            down2_compute = down2.to(grad_output_2d.dtype)
             grad_up2 = torch.mm(grad_output_2d.transpose(0, 1), low_rank2_2d).mul_(scale2)
-            grad_low_rank2 = torch.mm(grad_output_2d, up2).mul_(scale2)
+            grad_low_rank2 = torch.mm(grad_output_2d, up2_compute).mul_(scale2)
             grad_activated = torch.mm(grad_output_2d, base2)
-            grad_activated.addmm_(grad_low_rank2, down2)
+            grad_activated.addmm_(grad_low_rank2, down2_compute)
             if ctx.activation_storage == "fp8" and ctx.fp8_backend == "triton":
                 if ctx.direct_fp8_backward:
                     grad_pre_gelu = dequantize_gelu_grad_pre_fp8_triton(
@@ -244,10 +246,14 @@ class _FusedGELUMLP(torch.autograd.Function):
                         grad_activated,
                         ctx.pre_dtype,
                     )
+                    # dDown2 = grad_low_rank2.T @ GELU(pre).  Passing the
+                    # forward low_rank2 here silently injects a large,
+                    # incorrect gradient (especially because up2 starts at
+                    # zero); this must use the upstream gradient instead.
                     grad_down2 = grad_down2_from_fp8_triton(
                         stored_pre,
                         pre_scale,
-                        low_rank2_2d,
+                        grad_low_rank2,
                         down2.dtype,
                     )
                     activated_2d = None
@@ -269,8 +275,10 @@ class _FusedGELUMLP(torch.autograd.Function):
             if activated_2d is not None:
                 del activated_2d
 
+            up1_compute = up1.to(grad_pre_gelu.dtype)
+            down1_compute = down1.to(grad_pre_gelu.dtype)
             grad_up1 = torch.mm(grad_pre_gelu.transpose(0, 1), low_rank1_2d).mul_(scale1)
-            grad_low_rank1 = torch.mm(grad_pre_gelu, up1).mul_(scale1)
+            grad_low_rank1 = torch.mm(grad_pre_gelu, up1_compute).mul_(scale1)
             vjp_x_2d = x_2d
             if vjp_x_2d is None:
                 if ctx.input_fp8_backend == "triton":
@@ -280,7 +288,7 @@ class _FusedGELUMLP(torch.autograd.Function):
                 vjp_x_2d = restored_x.reshape(-1, restored_x.shape[-1])
             grad_down1 = torch.mm(grad_low_rank1.transpose(0, 1), vjp_x_2d)
             grad_x = torch.mm(grad_pre_gelu, base1)
-            grad_x.addmm_(grad_low_rank1, down1)
+            grad_x.addmm_(grad_low_rank1, down1_compute)
             return grad_x, grad_down1, grad_up1, grad_down2, grad_up2
 
         if ctx.autocast_enabled:
