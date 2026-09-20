@@ -75,6 +75,15 @@ class AnimaModelSession:
                     if p.requires_grad:
                         torch.nn.init.zeros_(p)
 
+    def cleanup_after_job(self) -> None:
+        """Release transient activations, gradients, and allocator cache after a job."""
+        logger.info("[AnimaModelSession] Releasing transient gradients and CUDA allocator cache...")
+        if self.network is not None:
+            self.network.zero_grad(set_to_none=True)
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     def close(self) -> None:
         del self.network
         del self.unet

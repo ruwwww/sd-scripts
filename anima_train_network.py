@@ -639,7 +639,16 @@ if __name__ == "__main__":
         try:
             trainer.train(args)
         finally:
-            if not getattr(args, "persistent_session", False) and os.environ.get("ANIMA_PERSISTENT_SESSION") != "1":
+            is_persistent = getattr(args, "persistent_session", False) or os.environ.get("ANIMA_PERSISTENT_SESSION") == "1"
+            if is_persistent:
+                try:
+                    from library.anima_session import AnimaModelSession
+                    session = AnimaModelSession.get_active_session()
+                    if session is not None:
+                        session.cleanup_after_job()
+                except Exception:
+                    pass
+            else:
                 try:
                     from library.anima_session import AnimaModelSession
                     AnimaModelSession.close_active_session()
