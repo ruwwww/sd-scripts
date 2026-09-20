@@ -1,6 +1,7 @@
 # Anima LoRA training script
 
 import argparse
+import os
 from typing import Any, Optional, Union
 
 import torch
@@ -32,6 +33,15 @@ setup_logging()
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_unwrap_model(model, accelerator):
+    if hasattr(model, "_orig_mod"):
+        return model._orig_mod
+    try:
+        return accelerator.unwrap_model(model)
+    except Exception:
+        return model
 
 
 class AnimaNetworkTrainer(train_network.NetworkTrainer):
@@ -98,6 +108,18 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
     def load_target_model(self, args, weight_dtype, accelerator):
         self.is_swapping_blocks = args.blocks_to_swap is not None and args.blocks_to_swap > 0
 
+        is_persistent = getattr(args, "persistent_session", False) or os.environ.get("ANIMA_PERSISTENT_SESSION") == "1"
+        if is_persistent:
+            try:
+                from library.anima_session import AnimaModelSession
+                session = AnimaModelSession.get_active_session()
+                if session is not None and session.text_encoders and session.vae is not None:
+                    logger.info("[AnimaModelSession] Reusing pre-loaded text encoders and VAE from active session")
+                    self.vae = session.vae
+                    return "anima", session.text_encoders, session.vae, session.unet
+            except Exception as e:
+                logger.debug("Session target model check exception: %s", e)
+
         # Load Qwen3 text encoder (tokenizers already loaded in get_tokenize_strategy)
         logger.info("Loading Qwen3 text encoder...")
         qwen3_text_encoder, _ = anima_utils.load_qwen3_text_encoder(args.qwen3, dtype=weight_dtype, device="cpu")
@@ -108,11 +130,23 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         vae = anima_train_utils.load_qwen_image_vae(args, device="cpu", disable_mmap=True)
         vae.to(weight_dtype)
         vae.eval()
+        self.vae = vae
 
         # Return format: (model_type, text_encoders, vae, unet)
         return "anima", [qwen3_text_encoder], vae, None  # unet loaded lazily
 
     def load_unet_lazily(self, args, weight_dtype, accelerator, text_encoders) -> tuple[nn.Module, list[nn.Module]]:
+        is_persistent = getattr(args, "persistent_session", False) or os.environ.get("ANIMA_PERSISTENT_SESSION") == "1"
+        if is_persistent:
+            try:
+                from library.anima_session import AnimaModelSession
+                session = AnimaModelSession.get_active_session()
+                if session is not None and session.unet is not None:
+                    logger.info("[AnimaModelSession] Reusing pre-loaded Anima DiT model from active session")
+                    return session.unet, session.text_encoders
+            except Exception as e:
+                logger.debug("Session unet check exception: %s", e)
+
         loading_dtype = None if args.fp8_scaled else weight_dtype
         loading_device = "cpu" if self.is_swapping_blocks else accelerator.device
 
@@ -185,6 +219,28 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             if enabled == 0:
                 raise RuntimeError("--fused_mlp found no eligible dropout-free LoRA GELU MLP modules")
             logger.info("Anima fused GELU MLP explicit-VJP path enabled for %d modules", enabled)
+
+        is_persistent = getattr(args, "persistent_session", False) or os.environ.get("ANIMA_PERSISTENT_SESSION") == "1"
+        if is_persistent:
+            try:
+                from library.anima_session import AnimaModelSession
+                if AnimaModelSession.get_active_session() is None:
+                    dit = _safe_unwrap_model(unet, accelerator)
+                    session = AnimaModelSession(
+                        session_key={
+                            "pretrained_model_name_or_path": str(args.pretrained_model_name_or_path),
+                            "network_dim": args.network_dim,
+                            "network_alpha": args.network_alpha,
+                        },
+                        text_encoders=text_encoders,
+                        vae=getattr(self, "vae", None),
+                        unet=dit,
+                        network=network,
+                    )
+                    AnimaModelSession.set_active_session(session)
+                    logger.info("[AnimaModelSession] Registered new active model session in VRAM")
+            except Exception as e:
+                logger.debug("Session registration exception: %s", e)
 
     def get_models_for_text_encoding(self, args, accelerator, text_encoders):
         if args.cache_text_encoder_outputs:
@@ -445,7 +501,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         if args.selective_checkpointing is not None or args.checkpoint_blocks is not None:
             from library.selective_checkpointing import apply_selective_checkpointing
 
-            dit = accelerator.unwrap_model(unet) if hasattr(accelerator, "unwrap_model") else unet
+            dit = _safe_unwrap_model(unet, accelerator)
             checkpoint_plan = apply_selective_checkpointing(
                 dit,
                 strategy=args.selective_checkpointing,
@@ -468,8 +524,8 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         else:
             model = unet
             model = accelerator.prepare(model, device_placement=[not self.is_swapping_blocks])
-            accelerator.unwrap_model(model).move_to_device_except_swap_blocks(accelerator.device)
-            accelerator.unwrap_model(model).prepare_block_swap_before_forward()
+            _safe_unwrap_model(model, accelerator).move_to_device_except_swap_blocks(accelerator.device)
+            _safe_unwrap_model(model, accelerator).prepare_block_swap_before_forward()
 
         # CUDA perf switches are independent of torch.compile; apply whenever requested.
         compile_utils.apply_cuda_optimizations(args)
@@ -477,8 +533,11 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         if args.compile:
             # Apply per-block torch.compile to the DiT blocks. Reach the real Anima via
             # unwrap_model so we mutate the underlying ModuleList regardless of any DDP wrapper.
-            dit = accelerator.unwrap_model(model)
-            compile_utils.compile_transformer(args, dit, [dit.blocks], disable_linear=self.is_swapping_blocks)
+            dit = _safe_unwrap_model(model, accelerator)
+            if hasattr(torch, "_dynamo") and len(dit.blocks) > 0 and isinstance(dit.blocks[0], getattr(torch._dynamo, "OptimizedModule", ())):
+                logger.info("[AnimaModelSession] DiT blocks are already compiled with torch.compile; skipping re-compilation")
+            else:
+                compile_utils.compile_transformer(args, dit, [dit.blocks], disable_linear=self.is_swapping_blocks)
 
         return model
 
@@ -549,6 +608,11 @@ def setup_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="experimental: compute dDown2 directly from the FP8 cache without materializing GELU activation",
     )
+    parser.add_argument(
+        "--persistent_session",
+        action="store_true",
+        help="keep base model, text encoders, VAE, and compiled DiT blocks persistent in VRAM across training runs",
+    )
     return parser
 
 
@@ -558,6 +622,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
     args_util.verify_command_line_training_args(args)
     args = args_util.read_config_from_file(args, parser)
+
+    if args.persistent_session:
+        os.environ["ANIMA_PERSISTENT_SESSION"] = "1"
 
     if args.selective_checkpointing is not None or args.checkpoint_blocks is not None:
         args.gradient_checkpointing = True
@@ -569,4 +636,12 @@ if __name__ == "__main__":
         anima_train_utils.show_timesteps(args)
     else:
         trainer = AnimaNetworkTrainer()
-        trainer.train(args)
+        try:
+            trainer.train(args)
+        finally:
+            if not getattr(args, "persistent_session", False) and os.environ.get("ANIMA_PERSISTENT_SESSION") != "1":
+                try:
+                    from library.anima_session import AnimaModelSession
+                    AnimaModelSession.close_active_session()
+                except Exception:
+                    pass

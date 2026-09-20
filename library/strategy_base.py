@@ -41,8 +41,6 @@ class TokenizeStrategy:
 
     @classmethod
     def set_strategy(cls, strategy):
-        if cls._strategy is not None:
-            raise RuntimeError(f"Internal error. {cls.__name__} strategy is already set")
         cls._strategy = strategy
 
     @classmethod
@@ -287,8 +285,6 @@ class TextEncodingStrategy:
 
     @classmethod
     def set_strategy(cls, strategy):
-        if cls._strategy is not None:
-            raise RuntimeError(f"Internal error. {cls.__name__} strategy is already set")
         cls._strategy = strategy
 
     @classmethod
@@ -336,8 +332,6 @@ class TextEncoderOutputsCachingStrategy:
 
     @classmethod
     def set_strategy(cls, strategy):
-        if cls._strategy is not None:
-            raise RuntimeError(f"Internal error. {cls.__name__} strategy is already set")
         cls._strategy = strategy
 
     @classmethod
@@ -389,8 +383,6 @@ class LatentsCachingStrategy:
 
     @classmethod
     def set_strategy(cls, strategy):
-        if cls._strategy is not None:
-            raise RuntimeError(f"Internal error. {cls.__name__} strategy is already set")
         cls._strategy = strategy
 
     @classmethod

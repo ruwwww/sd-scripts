@@ -132,6 +132,11 @@ def test_lora_module_fused_path_is_opt_in_and_trainable():
     assert lora.lora_up.weight.grad is not None
     assert x.grad is not None
 
+    # Test in-place reset_parameters
+    lora.lora_up.weight.data.fill_(1.23)
+    lora.reset_parameters()
+    assert torch.equal(lora.lora_up.weight, torch.zeros_like(lora.lora_up.weight))
+
 
 @pytest.mark.skipif(not torch.cuda.is_available() or not TRITON_AVAILABLE, reason="CUDA Triton is required")
 def test_direct_fp8_backward_matches_dequantized_reference():

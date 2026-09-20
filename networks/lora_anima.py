@@ -58,8 +58,7 @@ class LoRAModule(torch.nn.Module):
             self.lora_down = torch.nn.Linear(in_dim, self.lora_dim, bias=False)
             self.lora_up = torch.nn.Linear(self.lora_dim, out_dim, bias=False)
 
-        torch.nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
-        torch.nn.init.zeros_(self.lora_up.weight)
+        self.reset_parameters()
 
         if type(alpha) == torch.Tensor:
             alpha = alpha.detach().float().numpy()  # without casting, bf16 causes error
@@ -75,7 +74,13 @@ class LoRAModule(torch.nn.Module):
         self.module_dropout = module_dropout
         self._use_fused_lora = False
 
+    def reset_parameters(self):
+        torch.nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
+        torch.nn.init.zeros_(self.lora_up.weight)
+
     def apply_to(self):
+        if not hasattr(self, "org_module") or self.org_module is None:
+            return  # already applied to target module
         self.org_forward = self.org_module.forward
         self.org_module.forward = self.forward
 
@@ -270,6 +275,19 @@ def create_network(
         network_dim = 4
     if network_alpha is None:
         network_alpha = 1.0
+
+    if os.environ.get("ANIMA_PERSISTENT_SESSION") == "1":
+        try:
+            from library.anima_session import AnimaModelSession
+            session = AnimaModelSession.get_active_session()
+            if session is not None and session.network is not None:
+                if getattr(session.network, "lora_dim", None) == network_dim:
+                    logger.info("[AnimaModelSession] Reusing pre-hooked LoRA network in VRAM and resetting weights in-place")
+                    session.reset_for_new_job()
+                    session.network.multiplier = multiplier
+                    return session.network
+        except Exception as e:
+            logger.debug("Session check exception: %s", e)
 
     # train LLM adapter
     train_llm_adapter = kwargs.get("train_llm_adapter", "false")
@@ -618,6 +636,12 @@ class LoRANetwork(torch.nn.Module):
         logger.info(f"enabled explicit-VJP LoRA Linear path for {count} modules")
         return count
 
+    def reset_parameters(self):
+        """In-place reinitialization of LoRA parameters across all modules."""
+        for module in self.text_encoder_loras + self.unet_loras:
+            if hasattr(module, "reset_parameters"):
+                module.reset_parameters()
+
     def disable_fused_lora(self):
         for module in self.text_encoder_loras + self.unet_loras:
             if isinstance(module, LoRAModule):
@@ -777,6 +801,8 @@ class LoRANetwork(torch.nn.Module):
         return info
 
     def apply_to(self, text_encoders, unet, apply_text_encoder=True, apply_unet=True):
+        if getattr(self, "_applied_to_target", False):
+            return  # already applied in active session
         if unet is not None:
             self._unet_ref = weakref.ref(unet)
         if apply_text_encoder:
@@ -805,6 +831,7 @@ class LoRANetwork(torch.nn.Module):
             )
             if enabled == 0:
                 raise RuntimeError("deferred fused MLP activation found no eligible modules after apply_to")
+        self._applied_to_target = True
 
     def is_mergeable(self):
         return True
