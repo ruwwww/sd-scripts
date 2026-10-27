@@ -113,10 +113,8 @@ def attention(
         q, k, v = qkv_or_q
         q: torch.Tensor = q
         qkv_or_q.clear()
-        del qkv_or_q
     else:
         q: torch.Tensor = qkv_or_q
-        del qkv_or_q
         assert k is not None and v is not None, "k and v must be provided if qkv_or_q is a tensor"
     if attn_params is None:
         attn_params = AttentionParams.create_attention_params("torch", False)
@@ -153,9 +151,12 @@ def attention(
             attn_params = AttentionParams.create_attention_params(attn_params.attn_mode, True)  # do not in-place modify
             attn_params.seqlens = torch.tensor([q.shape[1]] * q.shape[0], device=q.device)
             attn_params.max_seqlen = q.shape[1]
-        q = [transpose_fn(q[i : i + 1, : attn_params.seqlens[i]]) for i in range(len(q))]
-        k = [transpose_fn(k[i : i + 1, : attn_params.seqlens[i]]) for i in range(len(k))]
-        v = [transpose_fn(v[i : i + 1, : attn_params.seqlens[i]]) for i in range(len(v))]
+        q_list, k_list, v_list = [], [], []
+        for i in range(len(q)):
+            q_list.append(transpose_fn(q[i : i + 1, : attn_params.seqlens[i]]))
+            k_list.append(transpose_fn(k[i : i + 1, : attn_params.seqlens[i]]))
+            v_list.append(transpose_fn(v[i : i + 1, : attn_params.seqlens[i]]))
+        q, k, v = q_list, k_list, v_list
     else:
         q = transpose_fn(q)
         k = transpose_fn(k)
@@ -171,11 +172,9 @@ def attention(
                 v[i] = None
                 x.append(pad_fn(x_i, attn_params.max_seqlen))  # B, H, L, D
             x = torch.cat(x, dim=0)
-            del q, k, v
 
         else:
             x = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_params.attention_mask, dropout_p=drop_rate)
-            del q, k, v
 
     elif attn_params.attn_mode == "xformers":
         if attn_params.split_attn:
@@ -187,11 +186,9 @@ def attention(
                 v[i] = None
                 x.append(pad_fn(x_i, attn_params.max_seqlen))  # B, L, H, D
             x = torch.cat(x, dim=0)
-            del q, k, v
 
         else:
             x = xops.memory_efficient_attention(q, k, v, attn_bias=attn_params.attention_mask, p=drop_rate)
-            del q, k, v
 
     elif attn_params.attn_mode == "sageattn":
         if attn_params.split_attn:
@@ -204,10 +201,8 @@ def attention(
                 v[i] = None
                 x.append(pad_fn(x_i, attn_params.max_seqlen))  # B, H, L, D
             x = torch.cat(x, dim=0)
-            del q, k, v
         elif attn_params.cu_seqlens is None:  # all tokens are valid
             x = sageattn(q, k, v)  # B, L, H, D. No dropout support
-            del q, k, v
         else:
             # Reshape to [(bxs), a, d]
             batch_size, seqlen = q.shape[0], q.shape[1]
@@ -219,7 +214,6 @@ def attention(
             x = sageattn_varlen(
                 q, k, v, attn_params.cu_seqlens, attn_params.cu_seqlens, attn_params.max_seqlen, attn_params.max_seqlen
             )
-            del q, k, v
 
             # Reshape x with shape [(bxs), a, d] to [b, s, a, d]
             x = x.view(batch_size, seqlen, x.shape[-2], x.shape[-1])  # B, L, H, D
@@ -235,10 +229,8 @@ def attention(
                 v[i] = None
                 x.append(pad_fn(x_i, attn_params.max_seqlen))  # B, L, H, D
             x = torch.cat(x, dim=0)
-            del q, k, v
         elif attn_params.cu_seqlens is None:  # all tokens are valid
             x = flash_attn_func(q, k, v, drop_rate)  # B, L, H, D
-            del q, k, v
         else:
             # Reshape to [(bxs), a, d]
             batch_size, seqlen = q.shape[0], q.shape[1]
@@ -250,7 +242,6 @@ def attention(
             x = flash_attn_varlen_func(
                 q, k, v, attn_params.cu_seqlens, attn_params.cu_seqlens, attn_params.max_seqlen, attn_params.max_seqlen, drop_rate
             )
-            del q, k, v
 
             # Reshape x with shape [(bxs), a, d] to [b, s, a, d]
             x = x.view(batch_size, seqlen, x.shape[-2], x.shape[-1])  # B, L, H, D

@@ -12,6 +12,7 @@ from .fp8_kernels import (
     TRITON_AVAILABLE,
     dequantize_gelu_backward_fp8_triton,
     dequantize_gelu_grad_pre_fp8_triton,
+    gelu_and_pack_rowwise_fp8_triton,
     grad_down2_from_fp8_triton,
     pack_rowwise_fp8_triton,
     unpack_rowwise_fp8_triton,
@@ -43,6 +44,9 @@ def _pack_fp8_with_backend(x: torch.Tensor, backend: str) -> tuple[torch.Tensor,
     if backend not in ("auto", "eager", "triton"):
         raise ValueError(f"unsupported FP8 kernel backend: {backend}")
     if backend in ("auto", "triton") and TRITON_AVAILABLE and x.is_cuda:
+        if torch.compiler.is_compiling():
+            quantized, scale = pack_rowwise_fp8_triton(x)
+            return quantized, scale, "triton"
         try:
             quantized, scale = pack_rowwise_fp8_triton(x)
             log_key = (backend, "triton", bool(x.is_cuda))
@@ -62,11 +66,48 @@ def _pack_fp8_with_backend(x: torch.Tensor, backend: str) -> tuple[torch.Tensor,
                 logger.warning("fused MLP FP8 Triton pack failed; falling back to eager: %s", error)
                 _FP8_BACKEND_LOGGED.add(log_key)
     quantized, scale = pack_rowwise_fp8(x)
-    log_key = (backend, "eager", bool(x.is_cuda))
-    if log_key not in _FP8_BACKEND_LOGGED:
-        logger.info("fused MLP FP8 activation backend selected: eager")
-        _FP8_BACKEND_LOGGED.add(log_key)
+    if not torch.compiler.is_compiling():
+        log_key = (backend, "eager", bool(x.is_cuda))
+        if log_key not in _FP8_BACKEND_LOGGED:
+            logger.info("fused MLP FP8 activation backend selected: eager")
+            _FP8_BACKEND_LOGGED.add(log_key)
     return quantized, scale, "eager"
+
+
+def _gelu_and_pack_fp8_with_backend(
+    pre_gelu: torch.Tensor,
+    backend: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, str]:
+    if backend not in ("auto", "eager", "triton"):
+        raise ValueError(f"unsupported FP8 kernel backend: {backend}")
+    if backend in ("auto", "triton") and TRITON_AVAILABLE and pre_gelu.is_cuda:
+        if torch.compiler.is_compiling():
+            activated, quantized, scale = gelu_and_pack_rowwise_fp8_triton(pre_gelu)
+            return activated, quantized, scale, "triton"
+        try:
+            activated, quantized, scale = gelu_and_pack_rowwise_fp8_triton(pre_gelu)
+            log_key = (backend, "triton", bool(pre_gelu.is_cuda))
+            if log_key not in _FP8_BACKEND_LOGGED:
+                logger.info("fused MLP FP8 activation backend selected: triton")
+                _FP8_BACKEND_LOGGED.add(log_key)
+            return activated, quantized, scale, "triton"
+        except torch.cuda.OutOfMemoryError:
+            raise
+        except Exception as error:
+            if backend == "triton":
+                raise
+            log_key = (backend, "eager", bool(pre_gelu.is_cuda))
+            if log_key not in _FP8_BACKEND_LOGGED:
+                logger.warning("fused MLP FP8 Triton pack failed; falling back to eager: %s", error)
+                _FP8_BACKEND_LOGGED.add(log_key)
+    activated = F.gelu(pre_gelu, approximate="none")
+    quantized, scale = pack_rowwise_fp8(pre_gelu)
+    if not torch.compiler.is_compiling():
+        log_key = (backend, "eager", bool(pre_gelu.is_cuda))
+        if log_key not in _FP8_BACKEND_LOGGED:
+            logger.info("fused MLP FP8 activation backend selected: eager")
+            _FP8_BACKEND_LOGGED.add(log_key)
+    return activated, quantized, scale, "eager"
 
 
 def _randomized_low_rank_storage(pre_gelu: torch.Tensor, rank: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -125,7 +166,10 @@ def _linear_lora_forward(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     low_rank = F.linear(x, lora_down)
     output = F.linear(x, base_weight)
-    output.add_(F.linear(low_rank, lora_up).mul_(scale))
+    out_2d = output.reshape(-1, output.shape[-1])
+    lr_2d = low_rank.reshape(-1, low_rank.shape[-1])
+    up_compute = lora_up.to(dtype=output.dtype) if lora_up.dtype != output.dtype else lora_up
+    out_2d.addmm_(lr_2d, up_compute.transpose(0, 1), beta=1.0, alpha=float(scale))
     return output, low_rank
 
 
@@ -158,19 +202,23 @@ class _FusedGELUMLP(torch.autograd.Function):
 
         first, low_rank1 = _linear_lora_forward(x, base1, down1, up1, scale1)
         pre_gelu = first
-        activated = F.gelu(pre_gelu, approximate="none")
-        output, low_rank2 = _linear_lora_forward(activated, base2, down2, up2, scale2)
 
         if activation_storage == "bf16":
+            activated = F.gelu(pre_gelu, approximate="none")
             stored_pre, pre_scale = pre_gelu, pre_gelu.new_empty((0,))
             selected_fp8_backend = "eager"
         elif activation_storage == "fp8":
-            stored_pre, pre_scale, selected_fp8_backend = _pack_fp8_with_backend(pre_gelu, fp8_backend)
+            activated, stored_pre, pre_scale, selected_fp8_backend = _gelu_and_pack_fp8_with_backend(
+                pre_gelu, fp8_backend
+            )
         elif activation_storage == "lowrank":
+            activated = F.gelu(pre_gelu, approximate="none")
             stored_pre, pre_scale = _randomized_low_rank_storage(pre_gelu, int(low_rank_rank))
             selected_fp8_backend = "eager"
         else:
             raise ValueError(f"unsupported activation storage mode: {activation_storage}")
+
+        output, low_rank2 = _linear_lora_forward(activated, base2, down2, up2, scale2)
 
         if store_input_fp8:
             if activation_storage != "fp8":
@@ -232,10 +280,14 @@ class _FusedGELUMLP(torch.autograd.Function):
         grad_output_2d = grad_output.reshape(-1, grad_output.shape[-1])
 
         def vjp():
-            up2_compute = up2.to(grad_output_2d.dtype)
-            down2_compute = down2.to(grad_output_2d.dtype)
-            grad_up2 = torch.mm(grad_output_2d.transpose(0, 1), low_rank2_2d).mul_(scale2)
-            grad_low_rank2 = torch.mm(grad_output_2d, up2_compute).mul_(scale2)
+            need_grad_x = ctx.needs_input_grad[0]
+            up2_compute = up2.to(grad_output_2d.dtype) if up2.dtype != grad_output_2d.dtype else up2
+            down2_compute = down2.to(grad_output_2d.dtype) if down2.dtype != grad_output_2d.dtype else down2
+            grad_up2 = torch.mm(grad_output_2d.transpose(0, 1), low_rank2_2d)
+            grad_low_rank2 = torch.mm(grad_output_2d, up2_compute)
+            if scale2 != 1.0:
+                grad_up2.mul_(scale2)
+                grad_low_rank2.mul_(scale2)
             grad_activated = torch.mm(grad_output_2d, base2)
             grad_activated.addmm_(grad_low_rank2, down2_compute)
             if ctx.activation_storage == "fp8" and ctx.fp8_backend == "triton":
@@ -275,10 +327,13 @@ class _FusedGELUMLP(torch.autograd.Function):
             if activated_2d is not None:
                 del activated_2d
 
-            up1_compute = up1.to(grad_pre_gelu.dtype)
-            down1_compute = down1.to(grad_pre_gelu.dtype)
-            grad_up1 = torch.mm(grad_pre_gelu.transpose(0, 1), low_rank1_2d).mul_(scale1)
-            grad_low_rank1 = torch.mm(grad_pre_gelu, up1_compute).mul_(scale1)
+            up1_compute = up1.to(grad_pre_gelu.dtype) if up1.dtype != grad_pre_gelu.dtype else up1
+            down1_compute = down1.to(grad_pre_gelu.dtype) if down1.dtype != grad_pre_gelu.dtype else down1
+            grad_up1 = torch.mm(grad_pre_gelu.transpose(0, 1), low_rank1_2d)
+            grad_low_rank1 = torch.mm(grad_pre_gelu, up1_compute)
+            if scale1 != 1.0:
+                grad_up1.mul_(scale1)
+                grad_low_rank1.mul_(scale1)
             vjp_x_2d = x_2d
             if vjp_x_2d is None:
                 if ctx.input_fp8_backend == "triton":
@@ -287,8 +342,11 @@ class _FusedGELUMLP(torch.autograd.Function):
                     restored_x = unpack_rowwise_fp8(stored_x, x_scale, ctx.input_dtype)
                 vjp_x_2d = restored_x.reshape(-1, restored_x.shape[-1])
             grad_down1 = torch.mm(grad_low_rank1.transpose(0, 1), vjp_x_2d)
-            grad_x = torch.mm(grad_pre_gelu, base1)
-            grad_x.addmm_(grad_low_rank1, down1_compute)
+            if need_grad_x:
+                grad_x = torch.mm(grad_pre_gelu, base1)
+                grad_x.addmm_(grad_low_rank1, down1_compute)
+            else:
+                grad_x = None
             return grad_x, grad_down1, grad_up1, grad_down2, grad_up2
 
         if ctx.autocast_enabled:
@@ -297,7 +355,7 @@ class _FusedGELUMLP(torch.autograd.Function):
         else:
             grad_x, grad_down1, grad_up1, grad_down2, grad_up2 = vjp()
 
-        if grad_x.dtype != ctx.input_dtype:
+        if grad_x is not None and grad_x.dtype != ctx.input_dtype:
             grad_x = grad_x.to(dtype=ctx.input_dtype)
         if grad_down1.dtype != down1.dtype:
             grad_down1 = grad_down1.to(dtype=down1.dtype)
@@ -309,7 +367,7 @@ class _FusedGELUMLP(torch.autograd.Function):
             grad_up2 = grad_up2.to(dtype=up2.dtype)
 
         return (
-            grad_x.reshape_as(stored_x),
+            grad_x.reshape_as(stored_x) if grad_x is not None else None,
             None,
             grad_down1.reshape_as(down1),
             grad_up1.reshape_as(up1),

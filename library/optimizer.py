@@ -245,12 +245,210 @@ def get_optimizer(args, trainable_params) -> tuple[str, str, object]:
             # Prodigy
             # check Prodigy is installed
             try:
+                import math
                 import prodigyopt
             except ImportError:
                 raise ImportError("No Prodigy / Prodigy がインストールされていないようです")
 
+            class _FastProdigy(prodigyopt.Prodigy):
+                """Foreach + single-sync Prodigy optimizer preserving exact Prodigy state and recurrence."""
+
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    self._fast_group_cache: dict[int, dict] = {}
+
+                @torch.no_grad()
+                def step(self, closure=None):
+                    # Fall back to reference step if closure, FSDP, CPU tensors, or non-unit slice_p are used
+                    for group in self.param_groups:
+                        if group.get("fsdp_in_use", False) or group.get("slice_p", 1) != 1:
+                            return super().step(closure=closure)
+                        for p in group["params"]:
+                            if p.grad is not None and (not p.is_cuda or hasattr(p, "_fsdp_flattened")):
+                                return super().step(closure=closure)
+                    if closure is not None:
+                        return super().step(closure=closure)
+
+                    group0 = self.param_groups[0]
+                    use_bias_correction = group0["use_bias_correction"]
+                    beta1, beta2 = group0["betas"]
+                    beta3 = group0["beta3"]
+                    if beta3 is None:
+                        beta3 = math.sqrt(beta2)
+                    k = group0["k"]
+                    d = group0["d"]
+                    d_max = group0["d_max"]
+                    d_coef = group0["d_coef"]
+                    lr = max(g["lr"] for g in self.param_groups)
+                    if use_bias_correction:
+                        bias_correction = ((1 - beta2 ** (k + 1)) ** 0.5) / (1 - beta1 ** (k + 1))
+                    else:
+                        bias_correction = 1
+                    dlr = d * lr * bias_correction
+                    growth_rate = group0["growth_rate"]
+                    decouple = group0["decouple"]
+                    d_numerator = group0["d_numerator"] * beta3
+
+                    dot_terms = []
+                    denom_terms = []
+
+                    for g_idx, group in enumerate(self.param_groups):
+                        decay = group["weight_decay"]
+                        group_lr = group["lr"]
+                        d0 = group["d0"]
+                        safeguard_warmup = group["safeguard_warmup"]
+                        if group_lr not in [lr, 0.0]:
+                            raise RuntimeError(
+                                "Setting different lr values in different parameter groups is only supported for values of 0"
+                            )
+
+                        active_p = [p for p in group["params"] if p.grad is not None]
+                        if not active_p:
+                            continue
+
+                        cache = self._fast_group_cache.get(g_idx)
+                        need_rebuild = cache is None or cache.get("param_ids") != [id(p) for p in active_p]
+
+                        for p in active_p:
+                            state = self.state[p]
+                            if "step" not in state:
+                                need_rebuild = True
+                                state["step"] = 0
+                                state["s"] = torch.zeros_like(p.data.flatten()).detach()
+                                if p.any():
+                                    state["p0"] = p.flatten().detach().clone()
+                                else:
+                                    state["p0"] = torch.tensor(0, device=p.device, dtype=p.dtype)
+                                if beta1 > 0:
+                                    state["exp_avg"] = torch.zeros_like(p.data).detach()
+                                state["exp_avg_sq"] = torch.zeros_like(p.data).detach()
+
+                        if need_rebuild:
+                            p_datas = [p.data for p in active_p]
+                            s_list = [self.state[p]["s"] for p in active_p]
+                            exp_avgs = [self.state[p]["exp_avg"] for p in active_p] if beta1 > 0 else []
+                            exp_avg_sqs = [self.state[p]["exp_avg_sq"] for p in active_p]
+                            nz_indices = [i for i, p in enumerate(active_p) if self.state[p]["p0"].ndim > 0]
+                            z_indices = [i for i, p in enumerate(active_p) if self.state[p]["p0"].ndim == 0]
+                            p0_nz_cat = (
+                                torch.cat([self.state[active_p[i]]["p0"].data for i in nz_indices])
+                                if nz_indices
+                                else None
+                            )
+                            cache = {
+                                "param_ids": [id(p) for p in active_p],
+                                "p_datas": p_datas,
+                                "s_list": s_list,
+                                "exp_avgs": exp_avgs,
+                                "exp_avg_sqs": exp_avg_sqs,
+                                "nz_indices": nz_indices,
+                                "z_indices": z_indices,
+                                "p0_nz_cat": p0_nz_cat,
+                            }
+                            self._fast_group_cache[g_idx] = cache
+
+                        grads = [p.grad.data for p in active_p]
+                        p_datas = cache["p_datas"]
+                        if decay != 0 and not decouple:
+                            torch._foreach_add_(grads, p_datas, alpha=decay)
+
+                        if group_lr > 0.0:
+                            s_list = cache["s_list"]
+                            exp_avg_sqs = cache["exp_avg_sqs"]
+                            sliced_grads = [g.reshape(-1) for g in grads]
+                            scale_factor = (d / d0) * dlr
+
+                            nz_indices = cache["nz_indices"]
+                            if nz_indices:
+                                g_nz = torch.cat([sliced_grads[i] for i in nz_indices])
+                                diff_nz = cache["p0_nz_cat"] - torch.cat([p_datas[i].reshape(-1) for i in nz_indices])
+                                dot_terms.append(torch.dot(g_nz, diff_nz).float() * scale_factor)
+                                del g_nz, diff_nz
+
+                            z_indices = cache["z_indices"]
+                            if z_indices:
+                                g_z = torch.cat([sliced_grads[i] for i in z_indices])
+                                p_z = torch.cat([p_datas[i].reshape(-1) for i in z_indices])
+                                dot_terms.append(-torch.dot(g_z, p_z).float() * scale_factor)
+                                del g_z, p_z
+
+                            if beta1 > 0:
+                                exp_avgs = cache["exp_avgs"]
+                                torch._foreach_mul_(exp_avgs, beta1)
+                                torch._foreach_add_(exp_avgs, grads, alpha=d * (1 - beta1))
+
+                            torch._foreach_mul_(exp_avg_sqs, beta2)
+                            torch._foreach_addcmul_(exp_avg_sqs, grads, grads, value=d * d * (1 - beta2))
+
+                            s_alpha = ((d / d0) * d) if safeguard_warmup else ((d / d0) * dlr)
+                            torch._foreach_mul_(s_list, beta3)
+                            torch._foreach_add_(s_list, sliced_grads, alpha=s_alpha)
+
+                            s_norms = torch._foreach_norm(s_list, ord=1)
+                            denom_terms.extend(s_norms)
+
+                    if not denom_terms:
+                        return None
+
+                    total_dot = torch.stack(dot_terms).sum() if dot_terms else torch.zeros((), device=denom_terms[0].device)
+                    total_denom = torch.stack(denom_terms).float().sum()
+                    scalars_cpu = torch.stack([total_dot, total_denom]).cpu()
+                    delta_numerator = float(scalars_cpu[0].item())
+                    d_denom = float(scalars_cpu[1].item())
+
+                    if d_denom == 0:
+                        return None
+
+                    global_d_numerator = d_numerator + delta_numerator
+                    global_d_denom = d_denom
+                    if lr > 0.0:
+                        d_hat = d_coef * global_d_numerator / global_d_denom
+                        if d == group0["d0"]:
+                            d = max(d, d_hat)
+                        d_max = max(d_max, d_hat)
+                        d = min(d_max, d * growth_rate)
+                    else:
+                        d_hat = d
+
+                    for g_idx, group in enumerate(self.param_groups):
+                        group["d_numerator"] = global_d_numerator
+                        group["d_denom"] = global_d_denom
+                        group["d"] = d
+                        group["d_max"] = d_max
+                        group["d_hat"] = d_hat
+
+                        decay = group["weight_decay"]
+                        eps = group["eps"]
+                        active_p = [p for p in group["params"] if p.grad is not None]
+                        if not active_p:
+                            group["k"] = group["k"] + 1
+                            continue
+
+                        for p in active_p:
+                            self.state[p]["step"] += 1
+
+                        cache = self._fast_group_cache[g_idx]
+                        p_datas = cache["p_datas"]
+                        exp_avg_sqs = cache["exp_avg_sqs"]
+                        denoms = torch._foreach_sqrt(exp_avg_sqs)
+                        torch._foreach_add_(denoms, d * eps)
+
+                        if decay != 0 and decouple:
+                            torch._foreach_add_(p_datas, p_datas, alpha=-decay * dlr)
+
+                        if beta1 > 0:
+                            exp_avgs = cache["exp_avgs"]
+                            torch._foreach_addcdiv_(p_datas, exp_avgs, denoms, value=-dlr)
+                        else:
+                            grads = [p.grad.data for p in active_p]
+                            torch._foreach_addcdiv_(p_datas, grads, denoms, value=-dlr * d)
+
+                        group["k"] = group["k"] + 1
+
+                    return None
+
             logger.info(f"use Prodigy optimizer | {optimizer_kwargs}")
-            optimizer_class = prodigyopt.Prodigy
+            optimizer_class = _FastProdigy
             optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
     elif optimizer_type == "Adafactor".lower():

@@ -223,6 +223,8 @@ class NetworkTrainer:
         return noise_pred
 
     def all_reduce_network(self, accelerator, network):
+        if accelerator.num_processes <= 1:
+            return
         for param in network.parameters():
             if param.grad is not None:
                 param.grad = accelerator.reduce(param.grad, reduction="mean")

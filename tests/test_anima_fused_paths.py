@@ -4,11 +4,16 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from networks.fused_lora import fused_lora_linear
+from networks.fused_lora import (
+    fused_cross_attn_kv_lora,
+    fused_lora_linear,
+    fused_self_attn_qkv_lora,
+)
 from networks.fused_mlp import fused_gelu_mlp, fused_gelu_mlp_fp8, fused_gelu_mlp_lowrank
 from networks.fp8_kernels import (
     TRITON_AVAILABLE,
     dequantize_gelu_grad_pre_fp8_triton,
+    gelu_and_pack_rowwise_fp8_triton,
     grad_down2_from_fp8_triton,
     pack_rowwise_fp8_triton,
     unpack_rowwise_fp8_triton,
@@ -206,3 +211,93 @@ def test_fused_mlp_direct_fp8_uses_gradient_for_second_down_projection():
 
     assert down2.grad is not None
     assert torch.equal(down2.grad, torch.zeros_like(down2.grad))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not TRITON_AVAILABLE, reason="CUDA Triton is required")
+def test_gelu_and_pack_rowwise_fp8_triton_matches_separate_ops():
+    torch.manual_seed(456)
+    pre = torch.randn(129, 512, device="cuda", dtype=torch.bfloat16).contiguous()
+    act_fused, q_fused, scale_fused = gelu_and_pack_rowwise_fp8_triton(pre)
+    act_ref = F.gelu(pre, approximate="none")
+    q_ref, scale_ref = pack_rowwise_fp8_triton(pre)
+
+    assert torch.allclose(act_fused.float(), act_ref.float(), atol=1e-2, rtol=1e-2)
+    assert torch.equal(scale_fused, scale_ref)
+    assert torch.equal(q_fused.view(torch.uint8), q_ref.view(torch.uint8))
+
+
+def test_fused_self_attn_qkv_and_cross_attn_kv_lora_match_reference_vjp():
+    torch.manual_seed(789)
+    dtype = torch.float64
+    x_ref = torch.randn(2, 5, 8, dtype=dtype, requires_grad=True)
+    x_test = x_ref.detach().clone().requires_grad_(True)
+    bq, bk, bv = [torch.randn(8, 8, dtype=dtype) for _ in range(3)]
+    dq_ref, dk_ref, dv_ref = [torch.randn(3, 8, dtype=dtype, requires_grad=True) for _ in range(3)]
+    uq_ref, uk_ref, uv_ref = [torch.randn(8, 3, dtype=dtype, requires_grad=True) for _ in range(3)]
+    dq_t, dk_t, dv_t = [w.detach().clone().requires_grad_(True) for w in (dq_ref, dk_ref, dv_ref)]
+    uq_t, uk_t, uv_t = [w.detach().clone().requires_grad_(True) for w in (uq_ref, uk_ref, uv_ref)]
+
+    q_ref = _linear_reference(x_ref, bq, dq_ref, uq_ref, 0.75)
+    k_ref = _linear_reference(x_ref, bk, dk_ref, uk_ref, 1.0)
+    v_ref = _linear_reference(x_ref, bv, dv_ref, uv_ref, 0.5)
+    q_t, k_t, v_t = fused_self_attn_qkv_lora(x_test, bq, dq_t, uq_t, 0.75, bk, dk_t, uk_t, 1.0, bv, dv_t, uv_t, 0.5)
+
+    gq, gk, gv = torch.randn_like(q_ref), torch.randn_like(k_ref), torch.randn_like(v_ref)
+    (q_ref * gq + k_ref * gk + v_ref * gv).sum().backward()
+    (q_t * gq + k_t * gk + v_t * gv).sum().backward()
+
+    for cand, ref in ((q_t, q_ref), (k_t, k_ref), (v_t, v_ref)):
+        assert torch.allclose(cand, ref, atol=1e-12, rtol=1e-12)
+    for cand, ref in (
+        (x_test.grad, x_ref.grad),
+        (dq_t.grad, dq_ref.grad),
+        (uq_t.grad, uq_ref.grad),
+        (dk_t.grad, dk_ref.grad),
+        (uk_t.grad, uk_ref.grad),
+        (dv_t.grad, dv_ref.grad),
+        (uv_t.grad, uv_ref.grad),
+    ):
+        assert torch.allclose(cand, ref, atol=1e-12, rtol=1e-12)
+
+    # Also test cross-attention KV with context.requires_grad=False
+    ctx_frozen = torch.randn(2, 4, 8, dtype=dtype, requires_grad=False)
+    dk2_t, dv2_t = [w.detach().clone().requires_grad_(True) for w in (dk_ref, dv_ref)]
+    uk2_t, uv2_t = [w.detach().clone().requires_grad_(True) for w in (uk_ref, uv_ref)]
+    k2_t, v2_t = fused_cross_attn_kv_lora(ctx_frozen, bk, dk2_t, uk2_t, 1.0, bv, dv2_t, uv2_t, 0.5)
+    (k2_t.sum() + v2_t.sum()).backward()
+    assert dk2_t.grad is not None and dv2_t.grad is not None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for _FastProdigy parity test")
+def test_fast_prodigy_matches_reference_prodigy():
+    import argparse
+    import prodigyopt
+    from library.optimizer import get_optimizer
+
+    torch.manual_seed(2026)
+    ref_params = [torch.randn(16, 64, device="cuda", dtype=torch.float32, requires_grad=True) for _ in range(8)]
+    fast_params = [p.detach().clone().requires_grad_(True) for p in ref_params]
+
+    opt_ref = prodigyopt.Prodigy(ref_params, lr=1.0, weight_decay=0.01)
+    args = argparse.Namespace(
+        optimizer_type="Prodigy",
+        learning_rate=1.0,
+        optimizer_args=["weight_decay=0.01"],
+        fused_backward_pass=False,
+        use_8bit_adam=False,
+        use_lion_optimizer=False,
+    )
+    _, _, opt_fast = get_optimizer(args, fast_params)
+
+    for _ in range(5):
+        for p_ref, p_fast in zip(ref_params, fast_params):
+            g = torch.randn_like(p_ref)
+            p_ref.grad = g.clone()
+            p_fast.grad = g.clone()
+        opt_ref.step()
+        opt_fast.step()
+
+    assert pytest.approx(opt_fast.param_groups[0]["d"], rel=1e-5, abs=1e-8) == opt_ref.param_groups[0]["d"]
+    for p_ref, p_fast in zip(ref_params, fast_params):
+        assert torch.allclose(p_fast, p_ref, atol=1e-6, rtol=1e-5)
+

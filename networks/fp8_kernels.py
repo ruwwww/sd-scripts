@@ -56,6 +56,34 @@ if TRITON_AVAILABLE:
         tl.store(scale_ptr + row, scale)
 
     @triton.jit
+    def _gelu_and_pack_rowwise_fp8_kernel(
+        pre_ptr,
+        act_ptr,
+        q_ptr,
+        scale_ptr,
+        n_columns,
+        pre_stride,
+        act_stride,
+        q_stride,
+        FP8_MAX_VALUE: tl.constexpr,
+        FP16_TINY_VALUE: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        columns = tl.arange(0, BLOCK)
+        mask = columns < n_columns
+        x = tl.load(pre_ptr + row * pre_stride + columns, mask=mask, other=0.0).to(tl.float32)
+        inv_sqrt_two = 0.7071067811865476
+        cdf = 0.5 * (1.0 + tl.erf(x * inv_sqrt_two))
+        activated = x * cdf
+        tl.store(act_ptr + row * act_stride + columns, activated, mask=mask)
+        amax = tl.max(tl.where(mask, tl.abs(x), 0.0), axis=0)
+        scale = tl.maximum(amax / FP8_MAX_VALUE, FP16_TINY_VALUE)
+        quantized = tl.minimum(tl.maximum(x / scale, -FP8_MAX_VALUE), FP8_MAX_VALUE)
+        tl.store(q_ptr + row * q_stride + columns, quantized, mask=mask)
+        tl.store(scale_ptr + row, scale)
+
+    @triton.jit
     def _dequantize_fp8_kernel(
         q_ptr,
         scale_ptr,
@@ -174,14 +202,14 @@ if TRITON_AVAILABLE:
             ).to(tl.float32)
             scales = tl.load(scale_ptr + row_offsets, mask=row_mask, other=0.0).to(tl.float32)
             pre = quantized * scales[:, None]
-            activated = pre * (0.5 * (1.0 + tl.erf(pre * 0.7071067811865476)))
+            activated = (pre * (0.5 * (1.0 + tl.erf(pre * 0.7071067811865476)))).to(tl.bfloat16)
             grad_low_rank = tl.load(
                 grad_low_rank_ptr
                 + row_offsets[None, :] * grad_low_stride_rows
                 + rows[:, None] * grad_low_stride_rank,
                 mask=(rows[:, None] < rank) & row_mask[None, :],
                 other=0.0,
-            ).to(tl.float32)
+            ).to(tl.bfloat16)
             acc += tl.dot(grad_low_rank, activated)
 
         tl.store(
@@ -225,6 +253,34 @@ def pack_rowwise_fp8_triton(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor
         num_warps=8 if block >= 1024 else 4,
     )
     return quantized.reshape(x.shape), scale.reshape(*x.shape[:-1], 1)
+
+
+def gelu_and_pack_rowwise_fp8_triton(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fuse exact GELU forward and rowwise FP8 packing of the pre-GELU tensor."""
+
+    matrix = x.reshape(-1, x.shape[-1])
+    if not _can_use_triton(matrix):
+        raise RuntimeError("Triton GELU+FP8 pack requires a contiguous CUDA matrix")
+    rows, columns = matrix.shape
+    activated = torch.empty_like(matrix)
+    quantized = torch.empty((rows, columns), device=x.device, dtype=FP8_DTYPE)
+    scale = torch.empty((rows,), device=x.device, dtype=torch.float16)
+    block = _next_power_of_two(columns)
+    _gelu_and_pack_rowwise_fp8_kernel[(rows,)](
+        matrix,
+        activated,
+        quantized,
+        scale,
+        columns,
+        matrix.stride(0),
+        activated.stride(0),
+        quantized.stride(0),
+        FP8_MAX_VALUE=FP8_MAX,
+        FP16_TINY_VALUE=FP16_TINY,
+        BLOCK=block,
+        num_warps=8 if block >= 1024 else 4,
+    )
+    return activated.reshape(x.shape), quantized.reshape(x.shape), scale.reshape(*x.shape[:-1], 1)
 
 
 def unpack_rowwise_fp8_triton(

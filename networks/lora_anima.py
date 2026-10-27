@@ -8,7 +8,7 @@ import weakref
 from typing import Dict, List, Optional, Tuple, Type, Union
 import torch
 from library.utils import setup_logging
-from .fused_lora import fused_lora_linear
+from .fused_lora import fused_cross_attn_kv_lora, fused_lora_linear, fused_self_attn_qkv_lora
 from .fused_mlp import fused_gelu_mlp, fused_gelu_mlp_fp8, fused_gelu_mlp_lowrank
 
 import logging
@@ -463,6 +463,8 @@ class LoRANetwork(torch.nn.Module):
         self._unet_ref = weakref.ref(unet) if unet is not None else None
         self._fused_mlp_bindings = []
         self._pending_fused_mlp = None
+        self._fused_attn_bindings = []
+        self._pending_fused_attn = False
         self.multiplier = multiplier
         self.lora_dim = lora_dim
         self.alpha = alpha
@@ -633,8 +635,138 @@ class LoRANetwork(torch.nn.Module):
             if isinstance(module, LoRAModule):
                 module.enable_fused_lora()
                 count += 1
+        self._bind_fused_attention_qkv()
         logger.info(f"enabled explicit-VJP LoRA Linear path for {count} modules")
         return count
+
+    def _bind_fused_attention_qkv(self):
+        self.disable_fused_attention_qkv()
+        unet = self._unet_ref() if self._unet_ref is not None else None
+        if unet is None:
+            return 0
+        lora_by_base = {}
+        needs_apply_defer = False
+        for lora in self.unet_loras:
+            org_forward = getattr(lora, "org_forward", None)
+            base_module = getattr(org_forward, "__self__", None)
+            if base_module is None:
+                base_module = getattr(lora, "org_module", None)
+                needs_apply_defer = needs_apply_defer or base_module is not None
+            if base_module is not None:
+                lora_by_base[id(base_module)] = lora
+        if needs_apply_defer:
+            self._pending_fused_attn = True
+            return 0
+
+        from library.anima_models import apply_rotary_pos_emb
+
+        enabled = 0
+        for attn in unet.modules():
+            if attn.__class__.__name__ != "Attention":
+                continue
+            lq = lora_by_base.get(id(getattr(attn, "q_proj", None)))
+            lk = lora_by_base.get(id(getattr(attn, "k_proj", None)))
+            lv = lora_by_base.get(id(getattr(attn, "v_proj", None)))
+            if lq is None or lk is None or lv is None:
+                continue
+            if any(
+                getattr(lora, field, None) is not None
+                for lora in (lq, lk, lv)
+                for field in ("dropout", "rank_dropout", "module_dropout")
+            ):
+                continue
+            bq = getattr(lq.org_forward, "__self__", None)
+            bk = getattr(lk.org_forward, "__self__", None)
+            bv = getattr(lv.org_forward, "__self__", None)
+            if not all(isinstance(b, torch.nn.Linear) and b.bias is None for b in (bq, bk, bv)):
+                continue
+
+            orig_compute_qkv = attn.compute_qkv
+            if getattr(attn, "is_selfattn", False):
+
+                def _fused_self_compute_qkv(module, x, context=None, rope_emb=None, _lq=lq, _lk=lk, _lv=lv, _orig=orig_compute_qkv):
+                    if (
+                        not module.training
+                        or not (_lq.training and _lk.training and _lv.training)
+                        or not (_lq._use_fused_lora and _lk._use_fused_lora and _lv._use_fused_lora)
+                        or context is not None
+                    ):
+                        return _orig(x, context, rope_emb=rope_emb)
+                    wq = _lq.org_forward.__self__.weight
+                    wk = _lk.org_forward.__self__.weight
+                    wv = _lv.org_forward.__self__.weight
+                    q, k, v = fused_self_attn_qkv_lora(
+                        x,
+                        wq,
+                        _lq.lora_down.weight,
+                        _lq.lora_up.weight,
+                        _lq.multiplier * _lq.scale,
+                        wk,
+                        _lk.lora_down.weight,
+                        _lk.lora_up.weight,
+                        _lk.multiplier * _lk.scale,
+                        wv,
+                        _lv.lora_down.weight,
+                        _lv.lora_up.weight,
+                        _lv.multiplier * _lv.scale,
+                    )
+                    q = module.q_norm(q.unflatten(-1, (module.n_heads, module.head_dim)))
+                    k = module.k_norm(k.unflatten(-1, (module.n_heads, module.head_dim)))
+                    v = module.v_norm(v.unflatten(-1, (module.n_heads, module.head_dim)))
+                    if module.is_selfattn and rope_emb is not None:
+                        q = apply_rotary_pos_emb(q, rope_emb, tensor_format=module.qkv_format, fused=False)
+                        k = apply_rotary_pos_emb(k, rope_emb, tensor_format=module.qkv_format, fused=False)
+                    return q, k, v
+
+                attn.compute_qkv = types.MethodType(_fused_self_compute_qkv, attn)
+            else:
+
+                def _fused_cross_compute_qkv(module, x, context=None, rope_emb=None, _lq=lq, _lk=lk, _lv=lv, _orig=orig_compute_qkv):
+                    if (
+                        not module.training
+                        or not (_lq.training and _lk.training and _lv.training)
+                        or not (_lq._use_fused_lora and _lk._use_fused_lora and _lv._use_fused_lora)
+                        or context is None
+                    ):
+                        return _orig(x, context, rope_emb=rope_emb)
+                    wq = _lq.org_forward.__self__.weight
+                    wk = _lk.org_forward.__self__.weight
+                    wv = _lv.org_forward.__self__.weight
+                    q = fused_lora_linear(
+                        x,
+                        wq,
+                        _lq.lora_down.weight,
+                        _lq.lora_up.weight,
+                        _lq.multiplier * _lq.scale,
+                    )
+                    k, v = fused_cross_attn_kv_lora(
+                        context,
+                        wk,
+                        _lk.lora_down.weight,
+                        _lk.lora_up.weight,
+                        _lk.multiplier * _lk.scale,
+                        wv,
+                        _lv.lora_down.weight,
+                        _lv.lora_up.weight,
+                        _lv.multiplier * _lv.scale,
+                    )
+                    q = module.q_norm(q.unflatten(-1, (module.n_heads, module.head_dim)))
+                    k = module.k_norm(k.unflatten(-1, (module.n_heads, module.head_dim)))
+                    v = module.v_norm(v.unflatten(-1, (module.n_heads, module.head_dim)))
+                    return q, k, v
+
+                attn.compute_qkv = types.MethodType(_fused_cross_compute_qkv, attn)
+
+            self._fused_attn_bindings.append((attn, orig_compute_qkv))
+            enabled += 1
+        return enabled
+
+    def disable_fused_attention_qkv(self):
+        for attn, orig_compute_qkv in getattr(self, "_fused_attn_bindings", ()):
+            attn.compute_qkv = orig_compute_qkv
+        if hasattr(self, "_fused_attn_bindings"):
+            self._fused_attn_bindings.clear()
+        self._pending_fused_attn = False
 
     def reset_parameters(self):
         """In-place reinitialization of LoRA parameters across all modules."""
@@ -643,6 +775,7 @@ class LoRANetwork(torch.nn.Module):
                 module.reset_parameters()
 
     def disable_fused_lora(self):
+        self.disable_fused_attention_qkv()
         for module in self.text_encoder_loras + self.unet_loras:
             if isinstance(module, LoRAModule):
                 module.disable_fused_lora()
@@ -818,6 +951,10 @@ class LoRANetwork(torch.nn.Module):
         for lora in self.text_encoder_loras + self.unet_loras:
             lora.apply_to()
             self.add_module(lora.lora_name, lora)
+
+        if getattr(self, "_pending_fused_attn", False):
+            self._pending_fused_attn = False
+            self._bind_fused_attention_qkv()
 
         if self._pending_fused_mlp is not None:
             activation_storage, activation_rank, fp8_backend, fp8_input, fp8_direct_backward = self._pending_fused_mlp

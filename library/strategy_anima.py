@@ -1,4 +1,4 @@
-﻿# Anima Strategy Classes
+# Anima Strategy Classes
 
 import os
 import random
@@ -102,9 +102,11 @@ class AnimaTextEncodingStrategy(TextEncodingStrategy):
 
         qwen3_input_ids = qwen3_input_ids.to(encoder_device)
         qwen3_attn_mask = qwen3_attn_mask.to(encoder_device)
-        outputs = qwen3_text_encoder(input_ids=qwen3_input_ids, attention_mask=qwen3_attn_mask)
-        prompt_embeds = outputs.last_hidden_state
-        prompt_embeds[~qwen3_attn_mask.bool()] = 0
+        need_grad = torch.is_grad_enabled() and any(p.requires_grad for p in qwen3_text_encoder.parameters())
+        with torch.set_grad_enabled(need_grad):
+            outputs = qwen3_text_encoder(input_ids=qwen3_input_ids, attention_mask=qwen3_attn_mask)
+            prompt_embeds = outputs.last_hidden_state
+            prompt_embeds = prompt_embeds.masked_fill(~qwen3_attn_mask.bool().unsqueeze(-1), 0)
 
         return [prompt_embeds, qwen3_attn_mask, t5_input_ids, t5_attn_mask]
 

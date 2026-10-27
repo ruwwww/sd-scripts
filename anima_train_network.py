@@ -305,6 +305,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         else:
             # move text encoder to device for encoding during training/validation
             text_encoders[0].to(accelerator.device)
+            self._text_encoders = text_encoders
 
     def sample_images(self, accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet):
         text_encoders = text_encoder if isinstance(text_encoder, list) else [text_encoder]  # compatibility
@@ -364,9 +365,8 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         tso = None
         if is_train and "custom_attributes" in batch:
             offsets = [ca.get("timestep_sampling", {}).get("offset", 0.0) for ca in batch["custom_attributes"]]
-            t = torch.tensor(offsets, dtype=torch.float32)
-            if t.abs().sum() > 0:
-                tso = t
+            if any(o != 0.0 for o in offsets):
+                tso = torch.tensor(offsets, dtype=torch.float32)
         noisy_model_input, timesteps, sigmas = flux_train_utils.get_noisy_model_input_and_timesteps(
             args, noise_scheduler, latents, noise, accelerator.device, weight_dtype,
             timestep_sampling_offset=tso,
@@ -537,7 +537,18 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             if hasattr(torch, "_dynamo") and len(dit.blocks) > 0 and isinstance(dit.blocks[0], getattr(torch._dynamo, "OptimizedModule", ())):
                 logger.info("[AnimaModelSession] DiT blocks are already compiled with torch.compile; skipping re-compilation")
             else:
-                compile_utils.compile_transformer(args, dit, [dit.blocks], disable_linear=self.is_swapping_blocks)
+                target_block_lists = [dit.blocks]
+                if getattr(dit, "use_llm_adapter", False) and hasattr(dit, "llm_adapter"):
+                    target_block_lists.append(dit.llm_adapter.blocks)
+                te_list = getattr(self, "_text_encoders", None)
+                if (
+                    te_list
+                    and not getattr(args, "cache_text_encoder_outputs", False)
+                    and not self.is_train_text_encoder(args)
+                    and hasattr(te_list[0], "layers")
+                ):
+                    target_block_lists.append(te_list[0].layers)
+                compile_utils.compile_transformer(args, dit, target_block_lists, disable_linear=self.is_swapping_blocks)
 
         return model
 

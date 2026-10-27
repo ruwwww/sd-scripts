@@ -167,6 +167,8 @@ def _apply_rotary_pos_emb_base(
     sin_ = torch.sin(freqs).to(t.dtype)
 
     rot_dim = freqs.shape[-1]
+    if rot_dim == t.shape[-1]:
+        return (t * cos_) + (_rotate_half(t, interleaved) * sin_)
     t, t_pass = t[..., :rot_dim], t[..., rot_dim:]
     t = (t * cos_) + (_rotate_half(t, interleaved) * sin_)
     return torch.cat((t, t_pass), dim=-1)
@@ -338,10 +340,9 @@ class Attention(nn.Module):
         context = x if context is None else context
         k = self.k_proj(context)
         v = self.v_proj(context)
-        q, k, v = map(
-            lambda t: rearrange(t, "b ... (h d) -> b ... h d", h=self.n_heads, d=self.head_dim),
-            (q, k, v),
-        )
+        q = q.unflatten(-1, (self.n_heads, self.head_dim))
+        k = k.unflatten(-1, (self.n_heads, self.head_dim))
+        v = v.unflatten(-1, (self.n_heads, self.head_dim))
 
         q = self.q_norm(q)
         k = self.k_norm(k)
@@ -367,9 +368,7 @@ class Attention(nn.Module):
                 q = q.to(target_dtype)
                 k = k.to(target_dtype)
         # return self.compute_attention(q, k, v)
-        qkv = [q, k, v]
-        del q, k, v
-        result = attention.attention(qkv, attn_params=attn_params)
+        result = attention.attention(q, k, v, attn_params=attn_params)
         return self.output_dropout(self.output_proj(result))
 
 
@@ -1221,12 +1220,13 @@ class Anima(nn.Module):
         fps: Optional[torch.Tensor] = None,
         padding_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        from torchvision import transforms
-
         if self.concat_padding_mask:
-            padding_mask = transforms.functional.resize(
-                padding_mask, list(x_B_C_T_H_W.shape[-2:]), interpolation=transforms.InterpolationMode.NEAREST
-            )
+            if padding_mask.shape[-2:] != x_B_C_T_H_W.shape[-2:]:
+                from torchvision import transforms
+
+                padding_mask = transforms.functional.resize(
+                    padding_mask, list(x_B_C_T_H_W.shape[-2:]), interpolation=transforms.InterpolationMode.NEAREST
+                )
             x_B_C_T_H_W = torch.cat([x_B_C_T_H_W, padding_mask.unsqueeze(1).repeat(1, 1, x_B_C_T_H_W.shape[2], 1, 1)], dim=1)
         x_B_T_H_W_D = self.x_embedder(x_B_C_T_H_W)
 
@@ -1315,14 +1315,17 @@ class Anima(nn.Module):
         """
         # Run LLM adapter inside forward for correct DDP gradient synchronization
         if t5_input_ids is not None and self.use_llm_adapter and hasattr(self, "llm_adapter"):
-            crossattn_emb = self.llm_adapter(
-                source_hidden_states=crossattn_emb,
-                target_input_ids=t5_input_ids,
-                target_attention_mask=t5_attn_mask,
-                source_attention_mask=source_attention_mask,
-            )
-            if t5_attn_mask is not None:
-                crossattn_emb[~t5_attn_mask.bool()] = 0
+            adapter_trainable = any(p.requires_grad for p in self.llm_adapter.parameters())
+            adapter_needs_grad = torch.is_grad_enabled() and (crossattn_emb.requires_grad or adapter_trainable)
+            with torch.set_grad_enabled(adapter_needs_grad):
+                crossattn_emb = self.llm_adapter(
+                    source_hidden_states=crossattn_emb,
+                    target_input_ids=t5_input_ids,
+                    target_attention_mask=t5_attn_mask,
+                    source_attention_mask=source_attention_mask,
+                )
+                if t5_attn_mask is not None:
+                    crossattn_emb = crossattn_emb.masked_fill(~t5_attn_mask.bool().unsqueeze(-1), 0)
 
         x_B_T_H_W_D, rope_emb_L_1_1_D, extra_pos_emb = self.prepare_embedded_sequence(
             x_B_C_T_H_W,
