@@ -1529,7 +1529,7 @@ class NetworkTrainer:
         clean_memory_on_device(accelerator.device)
 
         progress_bar = tqdm(
-            range(args.max_train_steps - initial_step), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps"
+            range(args.max_train_steps - initial_step), smoothing=0.1, disable=not accelerator.is_local_main_process, desc="steps"
         )
 
         validation_steps = (
@@ -1592,6 +1592,7 @@ class NetworkTrainer:
                     initial_step -= 1
                     continue
 
+                step_start_time = time.perf_counter()
                 with accelerator.accumulate(training_model):
                     on_step_start_for_network(text_encoder, unet)
 
@@ -1661,6 +1662,15 @@ class NetworkTrainer:
                     progress_bar.update(1)
                     global_step += 1
 
+                    # Track steady-state step duration (exclude initial torch.compile JIT compilation steps)
+                    step_dur = time.perf_counter() - step_start_time
+                    if not hasattr(self, "_step_durations"):
+                        self._step_durations = []
+                    if global_step > 2:
+                        self._step_durations.append(step_dur)
+                        if len(self._step_durations) > 10:
+                            self._step_durations.pop(0)
+
                     optimizer_eval_fn()
                     self.sample_images(
                         accelerator, args, None, global_step, accelerator.device, vae, tokenizers, text_encoder, unet
@@ -1695,6 +1705,8 @@ class NetworkTrainer:
                 loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
                 avr_loss: float = loss_recorder.moving_average
                 logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
+                if hasattr(self, "_step_durations") and self._step_durations:
+                    logs["step_s"] = f"{sum(self._step_durations) / len(self._step_durations):.2f}"
                 progress_bar.set_postfix(**{**max_mean_logs, **logs})
 
                 if is_tracking:
