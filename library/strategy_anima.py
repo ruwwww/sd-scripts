@@ -205,6 +205,40 @@ class AnimaTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
         t5_input_ids = data["t5_input_ids"]
         t5_attn_mask = data["t5_attn_mask"]
         caption_dropout_rate = data["caption_dropout_rate"]
+
+        if prompt_embeds.ndim == 3:
+            # Multi-variant cache written by anima_precache.py: [N_variants, L, D].
+            # Each variant is an independently shuffled / tag-dropped caption, so picking one at
+            # random per sample reproduces shuffle_caption + caption_tag_dropout_rate without the
+            # text encoder being present at training time.
+            idx = random.randrange(prompt_embeds.shape[0])
+            prompt_embeds = prompt_embeds[idx]
+            attn_mask = attn_mask[idx]
+            t5_input_ids = t5_input_ids[idx]
+            t5_attn_mask = t5_attn_mask[idx]
+
+        if "prompt_embeds_dtype" in data and str(data["prompt_embeds_dtype"]) == "bf16":
+            # raw bfloat16 bit patterns stored as uint16 -> exact float32 (bf16 is the top half of fp32)
+            prompt_embeds = (prompt_embeds.astype(np.uint32) << 16).view(np.float32)
+
+        # Multi-variant caches are stored trimmed to the longest valid sequence (right padding only);
+        # re-pad to the original max lengths so tensors are bit-identical to the online-encoding path
+        # (and torch.compile sees static shapes).
+        if "qwen3_max_length" in data:
+            qwen3_max_length = int(data["qwen3_max_length"])
+            if prompt_embeds.shape[0] < qwen3_max_length:
+                pad = qwen3_max_length - prompt_embeds.shape[0]
+                prompt_embeds = np.pad(prompt_embeds, ((0, pad), (0, 0)))
+                attn_mask = np.pad(attn_mask, (0, pad))
+        if "t5_max_length" in data:
+            t5_max_length = int(data["t5_max_length"])
+            if t5_input_ids.shape[0] < t5_max_length:
+                pad = t5_max_length - t5_input_ids.shape[0]
+                t5_input_ids = np.pad(t5_input_ids, (0, pad))
+                t5_attn_mask = np.pad(t5_attn_mask, (0, pad))
+
+        if prompt_embeds.dtype != np.float32:
+            prompt_embeds = prompt_embeds.astype(np.float32)
         return [prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask, caption_dropout_rate]
 
     def cache_batch_outputs(

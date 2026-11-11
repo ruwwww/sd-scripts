@@ -4,6 +4,7 @@ import argparse
 import os
 from typing import Any, Optional, Union
 
+import numpy as np
 import torch
 import torch.nn as nn
 from accelerate import Accelerator
@@ -35,6 +36,80 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+class SkippedTextEncoder(nn.Module):
+    """Parameter-free stand-in for Qwen3 when ``--skip_text_encoder`` is used.
+
+    All Qwen3 hidden states must already be on disk as ``*_anima_te.npz`` (see ``anima_precache.py``),
+    so the 1.2 GB text encoder never has to be downloaded or loaded. Any accidental forward call fails loudly.
+    """
+
+    def __init__(self, dtype: torch.dtype):
+        super().__init__()
+        self._placeholder_dtype = dtype
+        self.register_buffer("_device_anchor", torch.zeros(0), persistent=False)
+
+    @property
+    def device(self) -> torch.device:
+        return self._device_anchor.device
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self._placeholder_dtype
+
+    def forward(self, *args, **kwargs):
+        raise RuntimeError(
+            "--skip_text_encoder is set but a Qwen3 forward pass was requested. A text encoder output cache "
+            "(*_anima_te.npz) is missing; run anima_precache.py with the same dataset config first."
+        )
+
+
+class SkippedVAE(nn.Module):
+    """Parameter-free stand-in for the Qwen Image VAE when ``--skip_vae`` is used.
+
+    All latents must already be cached on disk as ``*_anima.npz`` (see ``anima_precache.py``).
+    """
+
+    def __init__(self, dtype: torch.dtype):
+        super().__init__()
+        self._placeholder_dtype = dtype
+        self.register_buffer("_device_anchor", torch.zeros(0), persistent=False)
+
+    @property
+    def device(self) -> torch.device:
+        return self._device_anchor.device
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self._placeholder_dtype
+
+    def encode_pixels_to_latents(self, *args, **kwargs):
+        raise RuntimeError(
+            "--skip_vae is set but a latent cache (*_anima.npz) is missing or stale for at least one image. "
+            "Run anima_precache.py with the same dataset config first."
+        )
+
+    def forward(self, *args, **kwargs):
+        return self.encode_pixels_to_latents()
+
+
+def apply_precache_flags(args) -> None:
+    """Resolve the implications of --skip_vae / --skip_text_encoder (idempotent)."""
+    if getattr(args, "skip_vae", False):
+        if not args.cache_latents or not args.cache_latents_to_disk:
+            logger.info("--skip_vae implies --cache_latents --cache_latents_to_disk")
+        args.cache_latents = True
+        args.cache_latents_to_disk = True
+    if getattr(args, "skip_text_encoder", False):
+        if not args.cache_text_encoder_outputs or not args.cache_text_encoder_outputs_to_disk:
+            logger.info("--skip_text_encoder implies --cache_text_encoder_outputs --cache_text_encoder_outputs_to_disk")
+        args.cache_text_encoder_outputs = True
+        args.cache_text_encoder_outputs_to_disk = True
+    if getattr(args, "skip_vae", False) or getattr(args, "skip_text_encoder", False):
+        if args.sample_prompts is not None:
+            logger.warning("--skip_vae/--skip_text_encoder cannot render samples; disabling --sample_prompts")
+            args.sample_prompts = None
+            args.sample_at_first = False
+
 def _safe_unwrap_model(model, accelerator):
     if hasattr(model, "_orig_mod"):
         return model._orig_mod
@@ -48,6 +123,11 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
     def __init__(self):
         super().__init__()
         self.sample_prompts_te_outputs = None
+
+    def train(self, args):
+        # must run before the base trainer builds caching strategies from these flags
+        apply_precache_flags(args)
+        return super().train(args)
 
     def assert_extra_args(
         self,
@@ -68,9 +148,17 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             args.cache_text_encoder_outputs = True
 
         if args.cache_text_encoder_outputs:
-            assert train_dataset_group.is_text_encoder_output_cacheable(
-                cache_supports_dropout=True
-            ), "when caching Text Encoder output, shuffle_caption, token_warmup_step or caption_tag_dropout_rate cannot be used"
+            if getattr(args, "skip_text_encoder", False):
+                # Multi-variant caches from anima_precache.py emulate shuffle_caption / caption_tag_dropout_rate
+                # by storing N pre-augmented captions per image; one is drawn at random per sample.
+                if not train_dataset_group.is_text_encoder_output_cacheable(cache_supports_dropout=True):
+                    logger.info(
+                        "--skip_text_encoder: caption shuffle/tag-dropout are served from multi-variant TE caches"
+                    )
+            else:
+                assert train_dataset_group.is_text_encoder_output_cacheable(
+                    cache_supports_dropout=True
+                ), "when caching Text Encoder output, shuffle_caption, token_warmup_step or caption_tag_dropout_rate cannot be used"
 
         assert (
             args.network_train_unet_only or not args.cache_text_encoder_outputs
@@ -114,21 +202,34 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
                 from library.anima_session import AnimaModelSession
                 session = AnimaModelSession.get_active_session()
                 if session is not None and session.text_encoders and session.vae is not None:
-                    logger.info("[AnimaModelSession] Reusing pre-loaded text encoders and VAE from active session")
-                    self.vae = session.vae
-                    return "anima", session.text_encoders, session.vae, session.unet
+                    session_has_te = not isinstance(session.text_encoders[0], SkippedTextEncoder)
+                    session_has_vae = not isinstance(session.vae, SkippedVAE)
+                    needs_te = not getattr(args, "skip_text_encoder", False)
+                    needs_vae = not getattr(args, "skip_vae", False)
+                    if (session_has_te or not needs_te) and (session_has_vae or not needs_vae):
+                        logger.info("[AnimaModelSession] Reusing pre-loaded text encoders and VAE from active session")
+                        self.vae = session.vae
+                        return "anima", session.text_encoders, session.vae, session.unet
             except Exception as e:
                 logger.debug("Session target model check exception: %s", e)
 
         # Load Qwen3 text encoder (tokenizers already loaded in get_tokenize_strategy)
-        logger.info("Loading Qwen3 text encoder...")
-        qwen3_text_encoder, _ = anima_utils.load_qwen3_text_encoder(args.qwen3, dtype=weight_dtype, device="cpu")
+        if getattr(args, "skip_text_encoder", False):
+            logger.info("--skip_text_encoder: Qwen3 weights are not loaded (using pre-cached *_anima_te.npz)")
+            qwen3_text_encoder = SkippedTextEncoder(weight_dtype)
+        else:
+            logger.info("Loading Qwen3 text encoder...")
+            qwen3_text_encoder, _ = anima_utils.load_qwen3_text_encoder(args.qwen3, dtype=weight_dtype, device="cpu")
         qwen3_text_encoder.eval()
 
         # Load VAE
-        logger.info("Loading Anima VAE...")
-        vae = anima_train_utils.load_qwen_image_vae(args, device="cpu", disable_mmap=True)
-        vae.to(weight_dtype)
+        if getattr(args, "skip_vae", False):
+            logger.info("--skip_vae: VAE weights are not loaded (using pre-cached *_anima.npz latents)")
+            vae = SkippedVAE(weight_dtype)
+        else:
+            logger.info("Loading Anima VAE...")
+            vae = anima_train_utils.load_qwen_image_vae(args, device="cpu", disable_mmap=True)
+            vae.to(weight_dtype)
         vae.eval()
         self.vae = vae
 
@@ -257,6 +358,36 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
     def cache_text_encoder_outputs_if_needed(
         self, args, accelerator: Accelerator, unet, vae, text_encoders, dataset: DatasetGroup, weight_dtype
     ):
+        if getattr(args, "skip_text_encoder", False):
+            # Qwen3 is not loaded: every image must already have a valid *_anima_te.npz.
+            caching_strategy = strategy_base.TextEncoderOutputsCachingStrategy.get_strategy()
+            missing = []
+            multi_variant = 0
+            for ds in dataset.datasets:
+                for info in ds.image_data.values():
+                    npz_path = caching_strategy.get_outputs_npz_path(info.absolute_path)
+                    if not caching_strategy.is_disk_cached_outputs_expected(npz_path):
+                        missing.append(npz_path)
+                        continue
+                    with np.load(npz_path) as npz:
+                        if npz["prompt_embeds"].ndim == 3 and npz["prompt_embeds"].shape[0] > 1:
+                            multi_variant += 1
+            if missing:
+                raise RuntimeError(
+                    f"--skip_text_encoder: {len(missing)} text encoder cache file(s) missing, e.g. {missing[0]}. "
+                    "Run anima_precache.py with the same dataset config first."
+                )
+            needs_variants = not dataset.is_text_encoder_output_cacheable(cache_supports_dropout=True)
+            if needs_variants and multi_variant == 0:
+                logger.warning(
+                    "--skip_text_encoder: shuffle_caption/caption_tag_dropout_rate are enabled but the TE caches are "
+                    "single-variant; captions will NOT be augmented. Re-run anima_precache.py with --te_variants > 1."
+                )
+            logger.info(f"--skip_text_encoder: using pre-cached TE outputs ({multi_variant} multi-variant files)")
+            # assigns info.text_encoder_outputs_npz; nothing is encoded because every cache is valid
+            dataset.new_cache_text_encoder_outputs(text_encoders, accelerator)
+            return
+
         if args.cache_text_encoder_outputs:
             if not args.lowram:
                 # We cannot move DiT to CPU because of block swap, so only move VAE
@@ -623,6 +754,18 @@ def setup_parser() -> argparse.ArgumentParser:
         "--persistent_session",
         action="store_true",
         help="keep base model, text encoders, VAE, and compiled DiT blocks persistent in VRAM across training runs",
+    )
+    parser.add_argument(
+        "--skip_vae",
+        action="store_true",
+        help="do not load the VAE; all latents must be pre-cached on disk by anima_precache.py "
+        "(implies --cache_latents --cache_latents_to_disk)",
+    )
+    parser.add_argument(
+        "--skip_text_encoder",
+        action="store_true",
+        help="do not load Qwen3; all TE outputs must be pre-cached on disk by anima_precache.py. Multi-variant caches "
+        "keep shuffle_caption/caption_tag_dropout_rate working (implies --cache_text_encoder_outputs[_to_disk])",
     )
     return parser
 
